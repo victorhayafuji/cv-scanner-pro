@@ -62,7 +62,7 @@ Crie o arquivo `.env` na raiz:
 
 ```env
 GOOGLE_API_KEY="sua_chave_do_gemini"
-JWT_SECRET_KEY="sua_chave_secreta_jwt"
+MODEL_NAME="gemini-2.5-flash"
 ```
 
 Inicie o servidor da API:
