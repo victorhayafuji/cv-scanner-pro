@@ -1,7 +1,7 @@
 import sys
 import os
 
-# Adiciona a pasta raiz ao path do Python para encontrar os módulos 'src'
+# Adiciona a pasta raiz ao path do Python para encontrar os módulos 'src'   
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from streamlit.web import cli as stcli
