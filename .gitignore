@@ -1,0 +1,49 @@
+# =========================
+# Arquivos de Dados (MVP SaaS)
+# =========================
+# Bloqueio crítico: Impede o vazamento de senhas hasheadas e dados dos candidatos
+*.xlsx
+*.csv
+dados_bi.xlsx
+usuarios.xlsx
+banco_faiss/
+banco_vetorial/
+project_bundle.txt
+txt-files/
+
+# =========================
+# Variáveis de Ambiente e Chaves
+# =========================
+.env
+.env.local
+.env.*.local
+
+# =========================
+# Back-end (Python / FastAPI)
+# =========================
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+env/
+.venv/
+.pytest_cache/
+
+# =========================
+# Front-end (Node.js / Next.js)
+# =========================
+node_modules/
+.next/
+out/
+build/
+dist/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# =========================
+# Sistema Operacional e IDEs
+# =========================
+.DS_Store
+.vscode/
+.idea/

@@ -1,0 +1,3828 @@
+# PROJECT CODEBASE BUNDLE
+# Contém todo o código fonte do projeto concatenado.
+
+
+==================================================
+FILE: src\api.py
+==================================================
+
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Depends, status
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from datetime import datetime, timedelta
+import pandas as pd
+import os
+
+from src.services.ai_engine import AIEngine
+from src.services.pdf_handler import processar_pdf
+from src.services.db_handler import salvar_candidato_excel
+from src.services.auth_handler import (
+    criar_usuario, buscar_usuario_por_email, verify_password, 
+    create_access_token, ACCESS_TOKEN_EXPIRE_MINUTES
+)
+from src.schemas import UserCreate, Token, ResultadoIA
+
+app = FastAPI(title="CV Engine Pro API", version="1.1")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# --- SEGURANÇA ---
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/v1/auth/login")
+
+async def get_current_user(token: str = Depends(oauth2_scheme)):
+    """Decodifica o token e valida se o usuário existe."""
+    from jose import JWTError, jwt
+    from src.services.auth_handler import SECRET_KEY, ALGORITHM
+
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Credenciais inválidas ou token expirado",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        email: str = payload.get("sub")
+        if email is None:
+            raise credentials_exception
+    except JWTError:
+        raise credentials_exception
+    
+    user = buscar_usuario_por_email(email)
+    if user is None:
+        raise credentials_exception
+    return user
+
+# --- ROTAS DE AUTENTICAÇÃO ---
+
+@app.post("/api/v1/auth/signup", response_model=dict)
+async def signup(user: UserCreate):
+    usuario_existente = buscar_usuario_por_email(user.email)
+    if usuario_existente:
+        raise HTTPException(status_code=400, detail="Email já cadastrado.")
+    
+    criar_usuario(user.email, user.password, user.nome_empresa)
+    return {"message": "Usuário criado com sucesso!"}
+
+@app.post("/api/v1/auth/login", response_model=Token)
+async def login(form_data: OAuth2PasswordRequestForm = Depends()):
+    usuario = buscar_usuario_por_email(form_data.username)
+    if not usuario or not verify_password(form_data.password, usuario['senha_hash']):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Email ou senha incorretos",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(
+        data={"sub": usuario['email']}, expires_delta=access_token_expires
+    )
+    return {"access_token": access_token, "token_type": "bearer"}
+
+@app.get("/api/v1/auth/me")
+async def read_users_me(current_user: dict = Depends(get_current_user)):
+    return {
+        "email": current_user["email"],
+        "empresa": current_user.get("empresa", "")
+    }
+
+# --- ROTAS DE NEGÓCIO ---
+
+@app.post("/api/v1/analisar-cv/")
+async def analisar_cv(
+    arquivo: UploadFile = File(...), 
+    vaga: str = Form(None),
+    current_user: dict = Depends(get_current_user) # Rota protegida
+):
+    try:
+        # 1. Processamento do PDF
+        splits = processar_pdf(arquivo.file)
+        if not splits:
+            raise HTTPException(status_code=400, detail="O arquivo parece ser uma imagem ou está vazio. Por favor, envie um PDF com texto selecionável.")
+
+        # 2. Motor de IA
+        engine = AIEngine()
+        resultado = engine.analisar_documentos(splits, vaga)
+
+        # 3. Persistência com Validação de Schema (Apenas se houver vaga)
+        if vaga:
+            try:
+                # Normalização de nomes
+                nome_arquivo_limpo = arquivo.filename.replace(".pdf", "").replace("_", " ").title() if arquivo.filename else "Candidato Desconhecido"
+                
+                # Instancia o Schema Pydantic para validar os tipos
+                dados_validados = ResultadoIA(
+                    nome_candidato=resultado.get("nome", nome_arquivo_limpo),
+                    cargo_alvo=vaga[:50] + "..." if len(vaga) > 50 else vaga,
+                    score_aderencia=int(resultado.get("match_percentual", 0)),
+                    nivel_senioridade=resultado.get("senioridade_inferida", resultado.get("senioridade", "N/A")), # Tenta pegar senioridade se IA retornar
+                    principais_skills=", ".join(resultado.get("pontos_fortes", [])),
+                    gaps_identificados=", ".join(resultado.get("gaps_tecnicos", [])),
+                    parecer_resumido=resultado.get("analise_comparativa", "")[:500],
+                    data_analise=datetime.now()
+                )
+
+                # Salva usando o handler existente (que espera listas flatten ou dict)
+                # O metodo db_handler.salvar_candidato_excel espera um dict com chaves específicas
+                # Vamos converter o modelo para dict compatível com o db_handler atual
+                # Nota: O db_handler.salvar_candidato_excel espera chaves específicas do AnaliseCurriculoBI
+                # Para evitar quebrar o db_handler agora, vamos usar o converter_para_bi do engine mas injetando a data
+                
+                # A função engine.converter_para_bi já faz o flat. Vamos usar ela.
+                dados_bi = engine.converter_para_bi(resultado, dados_validados.nome_candidato, vaga)
+                
+                # Injeta data_analise que não existe originalmente no AnaliseCurriculoBI antigo (se existir)
+                dados_bi['data_analise'] = dados_validados.data_analise.strftime("%Y-%m-%d %H:%M:%S")
+                
+                salvar_candidato_excel(dados_bi)
+
+            except Exception as e:
+                print(f"Erro ao salvar BI: {e}")
+                # Não falha a request se o log der erro, mas loga
+
+        return resultado
+
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erro interno do servidor: {str(e)}")
+
+@app.get("/api/v1/dashboard/metrics")
+async def dashboard_metrics(current_user: dict = Depends(get_current_user)): # Protegido
+    """Retorna KPIs e histórico recente para o Dashboard."""
+    CAMINHO_EXCEL = "dados_bi.xlsx"
+    
+    if not os.path.exists(CAMINHO_EXCEL):
+        return {
+            "total_cvs": 0,
+            "media_score": 0,
+            "recent_activity": []
+        }
+    
+    try:
+        df = pd.read_excel(CAMINHO_EXCEL)
+        
+        # KPIs
+        total_cvs = len(df)
+        media_score = int(df['score_aderencia'].mean()) if not df.empty else 0
+        
+        # Histórico Completo para Analytics (Client-Side Aggregation)
+        # Garante que data_analise esteja em string ISO para o front
+        if 'data_analise' in df.columns:
+            # Converte colunas de data que possam estar como objeto/datetime
+            df['data_analise'] = df['data_analise'].astype(str)
+            
+        df = df.fillna("")
+        
+        # Retorna lista completa para cálculos no front (Charts, Filtros de Data)
+        all_records = df.to_dict(orient="records")
+        
+        # Mantém compatibilidade com o dashboard antigo (recent_activity)
+        recent_activity = df.tail(10).iloc[::-1].to_dict(orient="records")
+        
+        return {
+            "total_cvs": total_cvs,
+            "media_score": media_score,
+            "recent_activity": recent_activity,
+            "all_records": all_records # Novo campo para o Analytics Dashboard
+        }
+    except Exception as e:
+        print(f"Erro ao ler dashboard: {e}")
+        raise HTTPException(status_code=500, detail="Erro ao carregar dados do dashboard.")
+
+
+==================================================
+FILE: src\config.py
+==================================================
+
+# Arquivo: src/config.py
+
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+
+class Config:
+    GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+
+    # SOLUÇÃO: Adicione o sufixo "-latest"
+    MODEL_NAME = os.getenv("MODEL_NAME", "gemini-2.5-flash")
+
+    EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+    CHUNK_SIZE = 800
+    CHUNK_OVERLAP = 150
+
+    @staticmethod
+    def validar():
+        if not Config.GOOGLE_API_KEY:
+            raise ValueError("A chave GOOGLE_API_KEY não foi encontrada no .env")
+
+==================================================
+FILE: src\models.py
+==================================================
+
+from pydantic import BaseModel, Field, field_validator
+from typing import List
+
+
+class PerfilCandidato(BaseModel):
+    # (Mantenha igual ao anterior)
+    nome: str = Field(description="Nome completo")
+    cargo_atual: str = Field(description="Cargo mais recente")
+    tempo_experiencia: str = Field(description="Tempo calculado de experiência em Dados/Tech")
+    skills_tecnicas: List[str] = Field(description="Lista de hard skills")
+    score_geral: int = Field(description="Nota de 0 a 100")
+    justificativa_score: str = Field(description="Por que essa nota foi dada?")
+    pontos_fortes: List[str]
+    pontos_atencao: List[str]
+    perguntas_entrevista: List[str]
+
+
+class AnaliseGap(BaseModel):
+    nome: str = Field(description="Nome completo do candidato")
+    # Componentes para cálculo determinístico
+    score_tecnico: int = Field(default=0, description="Pontos por Hard Skills (Máx 50)")
+    score_senioridade: int = Field(default=0, description="Pontos por Senioridade (Máx 30)")
+    score_diferencial: int = Field(default=0, description="Pontos por Diferenciais (Máx 20)")
+    # Mantemos este para compatibilidade com a UI e BI
+    match_percentual: int = Field(default=0, description="Será calculado pelo Python")
+    
+    analise_comparativa: str
+    pontos_fortes: List[str]
+    gaps_tecnicos: List[str]
+    perguntas_tira_teima: List[str]
+
+
+class CVOtimizado(BaseModel):
+    resumo_profissional_novo: str = Field(description="Versão reescrita do resumo, focado em impacto e senioridade.")
+
+    bullets_experiencia_star: List[str] = Field(description="""
+        5 bullet points de experiência reescritos usando o método STAR.
+        Devem incluir placeholders numéricos (ex: 'melhorando a performance em [X]%') onde faltarem dados.
+    """)
+
+    melhorias_realizadas: List[str] = Field(description="Lista curta explicando o que foi melhorado no texto.")
+
+    # --- NOVO CAMPO: O Reality Check ---
+    reality_check: List[str] = Field(description="""
+        Lista de 3 a 5 alertas críticos de veracidade. 
+        Exemplo: "Eu assumi que você liderou o projeto X, se você foi apenas participante, mude para 'Colaborei com...'".
+        Exemplo: "O termo 'Sênior' no resumo pode ser arriscado para seu tempo de XP, esteja pronto para defender."
+    """)
+
+
+class AnaliseCurriculoBI(BaseModel):
+    nome_candidato: str
+    cargo_alvo: str
+    score_aderencia: int  # 0 a 100
+    nivel_senioridade: str  # Junior, Pleno, Senior, Especialista
+    principais_skills: str  # FLAT: "Python, SQL, AWS"
+    gaps_identificados: str  # FLAT: "Inglês, Certificação Cloud"
+    parecer_resumido: str  # Max 2 frases
+
+    @field_validator("principais_skills", "gaps_identificados", mode="before")
+    @classmethod
+    def validar_lista_para_string(cls, v):
+        if isinstance(v, list):
+            return ", ".join(v)
+        return v
+
+==================================================
+FILE: src\schemas.py
+==================================================
+
+from pydantic import BaseModel
+from datetime import datetime
+from typing import Optional
+
+# --- SCHEMAS DE AUTENTICAÇÃO ---
+
+class UserCreate(BaseModel):
+    email: str
+    password: str
+    nome_empresa: str
+
+class UserLogin(BaseModel):
+    email: str
+    password: str
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str
+
+class TokenData(BaseModel):
+    email: Optional[str] = None
+
+# --- SCHEMAS DE DADOS (BI/IA) ---
+
+class ResultadoIA(BaseModel):
+    """Modelo rigoroso para validação da saída da IA antes de salvar."""
+    nome_candidato: str
+    cargo_alvo: str
+    score_aderencia: int
+    nivel_senioridade: str
+    principais_skills: str
+    gaps_identificados: str
+    parecer_resumido: str
+    data_analise: datetime
+
+
+==================================================
+FILE: src\services\ai_engine.py
+==================================================
+
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_community.vectorstores import FAISS
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import JsonOutputParser
+from src.config import Config
+from src.models import PerfilCandidato, AnaliseGap, CVOtimizado, AnaliseCurriculoBI  # <--- Importe o novo modelo
+from datetime import datetime
+
+
+class AIEngine:
+    def __init__(self):
+        # Motor Local (HuggingFace) para evitar erros de API
+        self.embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+
+        # Cérebro (Gemini)
+        self.llm = ChatGoogleGenerativeAI(
+            model=Config.MODEL_NAME,
+            temperature=0.0,  # <-- AQUI: Zero absoluto para consistência analítica
+            google_api_key=Config.GOOGLE_API_KEY,
+            max_retries=3 # Aproveitando para manter a blindagem contra erros 503
+        )
+
+    def analisar_documentos(self, splits, texto_vaga=None):
+        vector_store = FAISS.from_documents(splits, self.embeddings)
+        retriever = vector_store.as_retriever(search_kwargs={"k": 7})
+
+        query = "experiência projetos impacto ferramentas datas"
+        if texto_vaga:
+            query += f" {texto_vaga[:300]}"
+
+        docs = retriever.invoke(query)
+        contexto = "\n\n".join([d.page_content for d in docs])
+
+        if texto_vaga:
+            return self._executar_gap_analysis(contexto, texto_vaga)
+        else:
+            return self._executar_extracao_perfil(contexto)
+
+    # --- NOVA FUNÇÃO QUE ESTAVA FALTANDO ---
+    def otimizar_cv(self, splits, vaga=None):
+        # 1. Recupera o Contexto
+        vector_store = FAISS.from_documents(splits, self.embeddings)
+        docs = vector_store.as_retriever(search_kwargs={"k": 4}).invoke("experiência profissional projetos resumo")
+        contexto = "\n\n".join([d.page_content for d in docs])
+
+        # 2. Define a Data Dinâmica (Isso faltava!)
+        data_hoje = datetime.now().strftime("%d de %B de %Y")
+
+        parser = JsonOutputParser(pydantic_object=CVOtimizado)
+
+        # 3. Prompt com Consciência Temporal
+        prompt_template = """
+        Você é um Especialista em Carreira e "Ghostwriter" Sênior.
+
+        CONTEXTO TEMPORAL (CRÍTICO):
+        Hoje é dia: {data_hoje}
+        Use esta data para validar se as experiências são atuais, passadas ou futuras.
+
+        FASE 1: A OTIMIZAÇÃO (Copywriting)
+        Reescreva o perfil para torná-lo de ALTO IMPACTO.
+        - Use método STAR e verbos de ação.
+        - Invente placeholders numéricos ([X]%) onde faltar métrica.
+
+        FASE 2: O REALITY CHECK (Auditoria)
+        Analise o texto gerado vs. Original.
+        - Identifique exageros de senioridade.
+        - DATAS: Compare rigorosamente com a data de hoje ({data_hoje}).
+          - Se a data do CV for ANTERIOR a hoje, NÃO marque como erro de "data futura".
+          - Se a data do CV for POSTERIOR a hoje (Futuro): Alerte APENAS se não houver indicação de "Início Confirmado".
+
+        CONTEXTO ORIGINAL:
+        {contexto}
+
+        VAGA ALVO:
+        {vaga}
+
+        FORMATO JSON:
+        {format_instructions}
+        """
+
+        prompt = ChatPromptTemplate.from_template(prompt_template)
+        chain = prompt | self.llm | parser
+
+        # 4. Injeta a data na execução
+        return chain.invoke({
+            "contexto": contexto,
+            "vaga": vaga if vaga else "Genérica de Dados",
+            "data_hoje": data_hoje,  # <--- A correção está aqui
+            "format_instructions": parser.get_format_instructions()
+        })
+
+    def _executar_extracao_perfil(self, contexto):
+        parser = JsonOutputParser(pydantic_object=PerfilCandidato)
+        data_hoje = datetime.now().strftime("%B de %Y")
+        prompt = ChatPromptTemplate.from_template(
+            """Você é um CTO e Headhunter rigoroso. Analise o CV abaixo.
+            DATA DE HOJE: {data_hoje}
+            1. CÁLCULO DE EXPERIÊNCIA: Some apenas períodos em tecnologia. Resultado: "X anos e Y meses".
+            2. SCORING (0-100): Penalize falta de métricas e clichês.
+            3. PERGUNTAS: Gere 3 perguntas técnicas.
+            CV: {contexto}
+            JSON: {format_instructions}"""
+        )
+        chain = prompt | self.llm | parser
+        return chain.invoke(
+            {"contexto": contexto, "data_hoje": data_hoje, "format_instructions": parser.get_format_instructions()})
+
+    def _executar_gap_analysis(self, contexto, vaga):
+        parser = JsonOutputParser(pydantic_object=AnaliseGap)
+        data_hoje = datetime.now().strftime("%B de %Y")
+        
+        # Função auxiliar para arredondar para o múltiplo de 5 mais próximo
+        def arredondar_5(valor):
+            return int(5 * round(float(valor) / 5))
+
+        prompt = ChatPromptTemplate.from_template(
+            """Você é um auditor técnico. Sua tarefa é avaliar o CV contra a VAGA e atribuir notas parciais.
+            
+            HOJE É: {data_hoje}.
+            
+            REGRAS DE PONTUAÇÃO (RETORNE APENAS MÚLTIPLOS DE 5):
+            1. score_tecnico (0-50): Avalie Hard Skills.
+            2. score_senioridade (0-30): Avalie se o cargo/tempo bate com a vaga.
+            3. score_diferencial (0-20): Avalie extras e diferenciais pedidos.
+            
+            IMPORTANTE: Use apenas valores como 0, 5, 10, 15, 20, 25, 30...
+            
+            VAGA: {vaga}
+            CV: {contexto}
+            JSON: {format_instructions}"""
+        )
+        
+        chain = prompt | self.llm | parser
+        res = chain.invoke({
+            "contexto": contexto, 
+            "vaga": vaga, 
+            "data_hoje": data_hoje, 
+            "format_instructions": parser.get_format_instructions()
+        })
+
+        # --- BLINDAGEM MATEMÁTICA (ARREDONDAMENTO E SOMA) ---
+        res["score_tecnico"] = arredondar_5(res.get("score_tecnico", 0))
+        res["score_senioridade"] = arredondar_5(res.get("score_senioridade", 0))
+        res["score_diferencial"] = arredondar_5(res.get("score_diferencial", 0))
+
+        res["match_percentual"] = (
+            res["score_tecnico"] + 
+            res["score_senioridade"] + 
+            res["score_diferencial"]
+        )
+        
+        return res
+
+    def converter_para_bi(self, dados_gap: dict, nome: str, cargo: str) -> dict:
+        """
+        Adapta o dicionário de AnaliseGap para o formato flat do BI (AnaliseCurriculoBI).
+        """
+        # Lógica de inferência para campos faltantes
+        score = dados_gap.get("match_percentual", 0)
+        
+        # Inferência simples de senioridade baseada no score (pode ser melhorada com IA se quiser)
+        if score >= 85:
+            senioridade = "Senior/Especialista"
+        elif score >= 60:
+            senioridade = "Pleno"
+        else:
+            senioridade = "Junior/Iniciante"
+
+        # Converte listas para strings (embora o validator do Pydantic já faça isso na instanciação,
+        # aqui preparamos o dicionário para ser compatível antes mesmo da validação ou para o dict final)
+        skills = ", ".join(dados_gap.get("pontos_fortes", []))
+        gaps = ", ".join(dados_gap.get("gaps_tecnicos", []))
+
+        # Cria o objeto Pydantic para validar e depois exportar como dict
+        analise_bi = AnaliseCurriculoBI(
+            nome_candidato=nome,
+            cargo_alvo=cargo,
+            score_aderencia=score,
+            nivel_senioridade=senioridade,
+            principais_skills=skills,
+            gaps_identificados=gaps,
+            parecer_resumido=dados_gap.get("analise_comparativa", "")[:500] # Limita tamanho
+        )
+        
+        return analise_bi.model_dump()
+
+==================================================
+FILE: src\services\auth_handler.py
+==================================================
+
+from datetime import datetime, timedelta
+from typing import Optional
+from jose import JWTError, jwt
+import bcrypt  # Usando bcrypt diretamente
+import pandas as pd
+import os
+import uuid
+from src.config import Config
+
+# --- CONFIGURAÇÕES ---
+# Em produção, mova para variáveis de ambiente
+SECRET_KEY = "sua_secret_key_super_secreta_trocar_em_prod" 
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 300 # 5 horas para facilitar testes
+DB_USUARIOS = "usuarios.xlsx"
+
+# --- FUNÇÕES DE BANCO DE DADOS (EXCEL) ---
+
+def carregar_usuarios():
+    """Carrega o DataFrame de usuários ou cria um novo se não existir."""
+    if not os.path.exists(DB_USUARIOS):
+        df = pd.DataFrame(columns=['id_usuario', 'email', 'senha_hash', 'nome_empresa', 'data_criacao'])
+        df.to_excel(DB_USUARIOS, index=False)
+        return df
+    return pd.read_excel(DB_USUARIOS)
+
+def salvar_usuario_excel(novo_usuario_dict):
+    """Salva um novo usuário no Excel com tratamento de concorrência básico."""
+    try:
+        df = carregar_usuarios()
+        
+        # Verifica se email já existe
+        if not df[df['email'] == novo_usuario_dict['email']].empty:
+            raise ValueError("Email já cadastrado.")
+
+        novo_df = pd.DataFrame([novo_usuario_dict])
+        df_final = pd.concat([df, novo_df], ignore_index=True)
+        df_final.to_excel(DB_USUARIOS, index=False)
+    except PermissionError:
+        raise Exception("Erro de Permissão: Feche o arquivo usuarios.xlsx e tente novamente.")
+
+def buscar_usuario_por_email(email: str):
+    """Retorna o dicionário do usuário ou None."""
+    df = carregar_usuarios()
+    usuario = df[df['email'] == email]
+    if usuario.empty:
+        return None
+    return usuario.iloc[0].to_dict()
+
+# --- FUNÇÕES DE SEGURANÇA ---
+
+def verify_password(plain_password, hashed_password):
+    # Converte strings para bytes
+    if isinstance(plain_password, str):
+        plain_password = plain_password.encode('utf-8')
+    if isinstance(hashed_password, str):
+        hashed_password = hashed_password.encode('utf-8')
+    return bcrypt.checkpw(plain_password, hashed_password)
+
+def get_password_hash(password):
+    if isinstance(password, str):
+        password = password.encode('utf-8')
+    # Gera o hash e retorna como string para salvar no JSON/Excel
+    return bcrypt.hashpw(password, bcrypt.gensalt()).decode('utf-8')
+
+def criar_usuario(email, senha_raw, empresa):
+    """Cria novo usuário com hash de senha."""
+    senha_hash = get_password_hash(senha_raw)
+    novo_usuario = {
+        'id_usuario': str(uuid.uuid4()),
+        'email': email,
+        'senha_hash': senha_hash,
+        'nome_empresa': empresa,
+        'data_criacao': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    }
+    salvar_usuario_excel(novo_usuario)
+    return novo_usuario
+
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
+    to_encode = data.copy()
+    if expires_delta:
+        expire = datetime.utcnow() + expires_delta
+    else:
+        expire = datetime.utcnow() + timedelta(minutes=15)
+    
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
+
+
+==================================================
+FILE: src\services\db_handler.py
+==================================================
+
+import pandas as pd
+import os
+from datetime import datetime
+
+def salvar_candidato_excel(dados: dict, caminho_arquivo="dados_bi.xlsx") -> tuple[bool, str]:
+    """
+    Salva os dados do candidato em um arquivo Excel (append mode).
+    Retorna (Sucesso: bool, Mensagem: str)
+    """
+    # Adiciona timestamp da execução
+    dados["data_analise"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    # Cria DataFrame com uma única linha
+    df_novo = pd.DataFrame([dados])
+
+    try:
+        if os.path.exists(caminho_arquivo):
+            # Tenta ler o arquivo existente
+            try:
+                df_antigo = pd.read_excel(caminho_arquivo, engine='openpyxl')
+                df_final = pd.concat([df_antigo, df_novo], ignore_index=True)
+            except Exception as e:
+                return False, f"Erro ao ler arquivo existente: {str(e)}"
+        else:
+            df_final = df_novo
+
+        # Salva no arquivo (sobrescrevendo com os dados concatenados)
+        try:
+            df_final.to_excel(caminho_arquivo, index=False, engine='openpyxl')
+            return True, "Dados salvos com sucesso!"
+        except PermissionError:
+            return False, "Erro: O arquivo Excel está aberto. Feche-o e tente novamente."
+        except Exception as e:
+            return False, f"Erro ao salvar Excel: {str(e)}"
+
+    except Exception as e:
+        return False, f"Erro inesperado no DB Handler: {str(e)}"
+
+
+==================================================
+FILE: src\services\pdf_handler.py
+==================================================
+
+import os
+import tempfile
+from langchain_community.document_loaders import PyPDFLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from src.config import Config
+
+
+def processar_pdf(uploaded_file):
+    """Salva temporariamente, lê e fatia o PDF."""
+    print(f"Iniciando processamento de PDF...")
+    try:
+        # 1. Salvar arquivo temporário (Windows friendly)
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+            conteudo = uploaded_file.read()
+            print(f"Salvo arquivo temporário: {tmp.name}, Tamanho: {len(conteudo)} bytes")
+            if len(conteudo) == 0:
+                print("ERRO: Arquivo recebido está vazio (0 bytes).")
+                return None
+            tmp.write(conteudo)
+            tmp_path = tmp.name
+
+        # 2. Carregar
+        print(f"Tentando carregar PDF com PyPDFLoader: {tmp_path}")
+        loader = PyPDFLoader(tmp_path)
+        docs = loader.load()
+        print(f"PDF carregado com sucesso. Páginas: {len(docs)}")
+
+        # 3. Limpeza
+        try:
+            os.remove(tmp_path)
+        except Exception as e:
+            print(f"Aviso: Não foi possível remover arquivo temporário {tmp_path}: {e}")
+
+        # 4. Validação de Conteúdo (Texto Vazio/Imagem)
+        tem_texto = any(d.page_content.strip() for d in docs)
+        if not tem_texto:
+             print("AVISO: Nenhuma texto extraído. PDF pode ser imagem digitalizada.")
+             return None
+
+        # 5. Fatiamento (Chunking)
+        splitter = RecursiveCharacterTextSplitter(
+            chunk_size=Config.CHUNK_SIZE,
+            chunk_overlap=Config.CHUNK_OVERLAP
+        )
+        return splitter.split_documents(docs)
+
+    except Exception as e:
+        import traceback
+        print(f"ERRO CRÍTICO no PDF Handler: {e}")
+        traceback.print_exc()
+        return None
+
+==================================================
+FILE: src\ui\dashboard.py
+==================================================
+
+import streamlit as st
+import time
+from src.config import Config
+from src.services.pdf_handler import processar_pdf
+from src.services.ai_engine import AIEngine
+
+
+@st.cache_resource
+def carregar_motor_ia():
+    return AIEngine()
+
+
+def injetar_css():
+    st.markdown("""
+        <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap');
+        html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
+        .st-emotion-cache-1r6slb0, .st-emotion-cache-12w0pgk { border-radius: 12px; border: 1px solid #3a3a3a; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
+        .stButton>button { border-radius: 20px; height: 3em; font-weight: 600; }
+        [data-testid="stMetricValue"] { font-size: 2.5rem; font-weight: 700; }
+        /* Destaque para placeholders */
+        .placeholder-metric { color: #ffbd45; font-weight: bold; background: #3d3024; padding: 2px 6px; border-radius: 4px; }
+        </style>
+    """, unsafe_allow_html=True)
+
+
+def render_tag(texto, tipo="neutro"):
+    cores = {
+        "neutro": ("#262730", "#4e4e4e"),
+        "sucesso": ("#1e3a29", "#2e5c40"),
+        "erro": ("#3a1e1e", "#5c2e2e")
+    }
+    bg, border = cores.get(tipo, cores["neutro"])
+    return f"""<span style="background-color:{bg}; color:#fff; border:1px solid {border}; padding:4px 10px; border-radius:15px; font-size:0.8em; margin:3px; display:inline-block; font-weight:500;">{texto}</span>"""
+
+
+# --- TELAS DE ANÁLISE (Mantidas iguais) ---
+def exibir_landing_page():
+    st.markdown("---")
+    c1, c2 = st.columns([3, 2])
+    with c1:
+        st.markdown("## 🚀 Turbine seu CV com IA")
+        st.write("Receba uma análise de CTO e **reescreva seu currículo** automaticamente.")
+    with c2: st.info("👈 **Comece:** Upload do PDF na barra lateral.", icon="📂")
+
+
+def exibir_card_perfil(dados):
+    # (Código visual do Perfil que já fizemos...)
+    with st.container(border=True):
+        c1, c2, c3 = st.columns([1, 4, 2])
+        with c1:
+            nome_url = dados.get("nome", "User").replace(" ", "+")
+            st.image(f"https://ui-avatars.com/api/?name={nome_url}&background=0D8ABC&color=fff&size=128&bold=true",
+                     width=100)
+        with c2:
+            st.title(dados.get("nome"))
+            st.markdown(f"**{dados.get('cargo_atual')}**")
+            st.caption(f"⏱️ {dados.get('tempo_experiencia')}")
+            st.markdown(
+                "Stack Principal: " + "".join([render_tag(s) for s in dados.get("skills_tecnicas", [])[:6]]) + "...",
+                unsafe_allow_html=True)
+        with c3:
+            score = dados.get("score_geral", 0)
+            st.metric("Score", f"{score}/100", delta="Mercado", delta_color="normal")
+
+    st.markdown("### 🧐 Veredito")
+    st.info(dados.get("justificativa_score"), icon="🤖")
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("### 🚀 Pontos Fortes")
+        for p in dados.get("pontos_fortes", []): st.markdown(f"✅ {p}")
+    with c2:
+        st.markdown("### ⚠️ Atenção")
+        for p in dados.get("pontos_atencao", []): st.markdown(f"🔻 {p}")
+
+
+def exibir_card_gap(dados):
+    # (Código visual do Gap Analysis que já fizemos...)
+    match = dados.get("match_percentual", 0)
+    st.markdown(f"### 🎯 Aderência: {match}%")
+    st.progress(min(max(match, 0), 100) / 100)
+    st.write(dados.get("analise_comparativa"))
+    c1, c2 = st.columns(2)
+    with c1:
+        st.success("✅ O que você TEM")
+        st.markdown("".join([render_tag(s, "sucesso") for s in dados.get("pontos_fortes", [])]), unsafe_allow_html=True)
+    with c2:
+        st.error("❌ O que FALTA")
+        st.markdown("".join([render_tag(s, "erro") for s in dados.get("gaps_tecnicos", [])]), unsafe_allow_html=True)
+
+# --- ATUALIZAÇÃO NESTA FUNÇÃO: ---
+def exibir_otimizador(engine, splits, vaga=None):
+    st.markdown("### ✨ Otimizador de Conteúdo (AI Writer)")
+    st.write("Abaixo, uma versão reescrita do seu perfil focada em **Impacto** e **Senioridade**.")
+
+    if st.button("⚡ Gerar Versão Otimizada", type="primary"):
+        with st.spinner("Reescrevendo e auditando veracidade..."):
+            otimizado = engine.otimizar_cv(splits, vaga)
+
+            # 1. Resumo
+            with st.container(border=True):
+                st.subheader("📝 Novo Resumo Profissional")
+                st.code(otimizado.get("resumo_profissional_novo"), language="text")
+                st.caption("Copie este texto para o topo do seu CV/LinkedIn.")
+
+            # 2. Experiências (Bullets)
+            with st.container(border=True):
+                st.subheader("💼 Experiências Turbinadas (Método STAR)")
+                st.write("Substitua seus bullet points antigos por estes:")
+
+                for bullet in otimizado.get("bullets_experiencia_star", []):
+                    # Highlight visual nos placeholders [X]
+                    bullet_formatado = bullet.replace("[", "<span class='placeholder-metric'>[").replace("]",
+                                                                                                         "]</span>")
+                    st.markdown(f"🔸 {bullet_formatado}", unsafe_allow_html=True)
+
+                st.info("💡 **Dica:** Onde estiver amarelo, insira seus números reais (ex: 20%, R$ 50k, 3 dias).")
+
+            # --- NOVO: BLOCO REALITY CHECK ---
+            st.markdown("---")
+            with st.container(border=True):
+                st.markdown("### 🕵️ Reality Check (Auditoria de Veracidade)")
+                st.markdown(
+                    "_A IA foi agressiva na venda. Verifique estes pontos para não cair em contradição na entrevista:_")
+
+                for alerta in otimizado.get("reality_check", []):
+                    # Ícone de alerta piscando mentalmente
+                    st.error(f"⚠️ {alerta}", icon="🚨")
+
+            # 3. Log de Melhorias (agora no fim)
+            with st.expander("Ver log técnico de melhorias"):
+                for m in otimizado.get("melhorias_realizadas", []):
+                    st.markdown(f"- {m}")
+
+
+# --- MAIN ---
+def renderizar_interface():
+    st.set_page_config(page_title="CV Engine Pro", page_icon="🧩", layout="wide")
+    injetar_css()
+    st.title("🧩 CV Engine Pro v3.0 (Final)")
+
+    if "motor_carregado" not in st.session_state:
+        try:
+            Config.validar()
+            carregar_motor_ia()
+            st.session_state["motor_carregado"] = True
+        except Exception as e:
+            st.error(f"Erro config: {e}")
+            st.stop()
+
+    with st.sidebar:
+        st.header("📂 Upload")
+        arquivo = st.file_uploader("Seu Currículo (PDF)", type="pdf")
+        st.divider()
+        st.header("🎯 Vaga Alvo")
+        vaga = st.text_area("Descrição da Vaga...", height=200)
+
+    if arquivo:
+        # SISTEMA DE ABAS
+        tab1, tab2 = st.tabs(["📊 Análise & Diagnóstico", "✨ Otimizador de Texto"])
+
+        # Variável para guardar splits e evitar reprocessar
+        if "splits" not in st.session_state:
+            st.session_state["splits"] = processar_pdf(arquivo)
+
+        splits = st.session_state["splits"]
+        engine = carregar_motor_ia()
+
+        with tab1:
+            if st.button("🔍 Rodar Análise", type="primary", key="btn_analise"):
+                with st.spinner("Analisando..."):
+                    try:
+                        res = engine.analisar_documentos(splits, vaga)
+                        if vaga:
+                            exibir_card_gap(res)
+                        else:
+                            exibir_card_perfil(res)
+                        
+                        # --- NOVO: SALVAR NO BI ---
+                        try:
+                            from src.services.db_handler import salvar_candidato_excel
+                            
+                            # --- CORREÇÃO: Extração Inteligente do Nome ---
+                            nome_limpo_arquivo = arquivo.name.replace(".pdf", "").replace("_", " ").title()
+                            nome_candidato = res.get("nome", nome_limpo_arquivo)
+                            
+                            if vaga:
+                                dados_bi = engine.converter_para_bi(res, nome_candidato, vaga)
+                                sucesso, msg = salvar_candidato_excel(dados_bi)
+                                if sucesso:
+                                    st.toast(f"✅ {msg}", icon="💾")
+                                else:
+                                    st.warning(f"⚠️ BI: {msg}")
+                        except Exception as e:
+                            st.error(f"Erro ao salvar no BI: {e}")
+
+                    except Exception as e:
+                        st.error(f"Erro na Análise: {str(e)}")
+                        # Opcional: mostrar stack trace
+                        # import traceback
+                        # st.code(traceback.format_exc())
+
+        with tab2:
+            exibir_otimizador(engine, splits, vaga)
+
+    else:
+        exibir_landing_page()
+
+
+if __name__ == "__main__":
+    renderizar_interface()
+
+==================================================
+FILE: frontend\src\App.css
+==================================================
+
+#root {
+  max-width: 1280px;
+  margin: 0 auto;
+  padding: 2rem;
+  text-align: center;
+}
+
+.logo {
+  height: 6em;
+  padding: 1.5em;
+  will-change: filter;
+  transition: filter 300ms;
+}
+.logo:hover {
+  filter: drop-shadow(0 0 2em #646cffaa);
+}
+.logo.react:hover {
+  filter: drop-shadow(0 0 2em #61dafbaa);
+}
+
+@keyframes logo-spin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  a:nth-of-type(2) .logo {
+    animation: logo-spin infinite 20s linear;
+  }
+}
+
+.card {
+  padding: 2em;
+}
+
+.read-the-docs {
+  color: #888;
+}
+
+
+==================================================
+FILE: frontend\src\App.jsx
+==================================================
+
+import React from 'react';
+import { BrowserRouter as Router, Routes, Route, Navigate } from 'react-router-dom';
+import { AuthProvider } from './context/AuthContext';
+import ProtectedRoute from './components/ProtectedRoute';
+import Dashboard from './pages/Dashboard';
+import Login from './pages/Login';
+import Signup from './pages/Signup';
+import AnalyticsDashboard from './pages/AnalyticsDashboard';
+
+export default function App() {
+  return (
+    <Router>
+      <AuthProvider>
+        <Routes>
+          <Route path="/login" element={<Login />} />
+          <Route path="/signup" element={<Signup />} />
+
+          <Route
+            path="/"
+            element={
+              <ProtectedRoute>
+                <Dashboard />
+              </ProtectedRoute>
+            }
+          />
+          <Route
+            path="/analytics"
+            element={
+              <ProtectedRoute>
+                <AnalyticsDashboard />
+              </ProtectedRoute>
+            }
+          />
+
+          <Route path="*" element={<Navigate to="/" replace />} />
+        </Routes>
+      </AuthProvider>
+    </Router>
+  );
+}
+
+
+==================================================
+FILE: frontend\src\index.css
+==================================================
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  body {
+    @apply bg-slate-950 text-slate-100 font-sans antialiased selection:bg-brand-neon selection:text-slate-900;
+  }
+}
+
+@layer utilities {
+  .custom-scrollbar::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+
+  .custom-scrollbar::-webkit-scrollbar-track {
+    @apply bg-slate-900 rounded-full;
+  }
+
+  .custom-scrollbar::-webkit-scrollbar-thumb {
+    @apply bg-slate-700 hover:bg-slate-600 rounded-full border-2 border-slate-900;
+  }
+}
+
+==================================================
+FILE: frontend\src\main.jsx
+==================================================
+
+import { StrictMode } from 'react'
+import { createRoot } from 'react-dom/client'
+import './index.css'
+import App from './App.jsx'
+
+createRoot(document.getElementById('root')).render(
+  <StrictMode>
+    <App />
+  </StrictMode>,
+)
+
+
+==================================================
+FILE: frontend\src\components\BentoGrid.jsx
+==================================================
+
+import React from 'react';
+import { CheckCircle2, AlertTriangle, Quote } from 'lucide-react';
+import { motion } from 'framer-motion';
+
+export default function BentoGrid({ analysis, strengths, gaps }) {
+    return (
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-8 mt-8">
+
+            {/* 1. Análise Comparativa (Grande - Span 2) */}
+            <div className="lg:col-span-2 bg-slate-900 rounded-3xl p-8 border border-slate-800 shadow-2xl relative overflow-hidden group hover:border-slate-700 transition-colors">
+                <div className="absolute top-0 left-0 w-32 h-32 bg-blue-600/10 rounded-full blur-3xl -ml-10 -mt-10 group-hover:bg-blue-600/20 transition-colors duration-500" />
+                <Quote className="w-12 h-12 text-slate-800 mb-6" />
+                <h3 className="text-2xl font-bold text-white mb-6 relative z-10">Análise do Especialista</h3>
+                <p className="text-slate-300 leading-relaxed text-lg whitespace-pre-wrap relative z-10 font-light">
+                    {analysis}
+                </p>
+            </div>
+
+            {/* 2. Coluna Lateral (Pontos Fortes & Gaps) */}
+            <div className="space-y-8">
+
+                {/* Pontos Fortes */}
+                <div className="bg-slate-900 rounded-3xl p-8 border border-slate-800 shadow-2xl hover:border-slate-700 transition-colors relative overflow-hidden">
+                    <div className="absolute top-0 right-0 w-24 h-24 bg-emerald-500/10 rounded-full blur-2xl -mr-10 -mt-10" />
+                    <h4 className="text-emerald-400 font-bold mb-6 flex items-center gap-3 text-lg">
+                        <CheckCircle2 className="w-6 h-6" /> Pontos Fortes
+                    </h4>
+                    <ul className="space-y-4">
+                        {strengths.map((item, idx) => (
+                            <motion.li
+                                key={idx}
+                                initial={{ opacity: 0, x: -10 }}
+                                animate={{ opacity: 1, x: 0 }}
+                                transition={{ delay: idx * 0.1 }}
+                                className="flex items-start gap-4 text-slate-300 text-sm font-medium"
+                            >
+                                <span className="mt-1.5 w-1.5 h-1.5 rounded-full bg-emerald-400 flex-shrink-0 shadow-[0_0_8px_rgba(52,211,153,0.8)]" />
+                                {item}
+                            </motion.li>
+                        ))}
+                    </ul>
+                </div>
+
+                {/* Gaps (Estilo Alerta High Contrast) */}
+                <div className="bg-brand-neon rounded-3xl p-8 shadow-[0_0_40px_rgba(163,230,53,0.2)] border border-lime-300 relative overflow-hidden">
+                    <div className="absolute -bottom-10 -right-10 w-40 h-40 bg-white/20 rounded-full blur-3xl" />
+                    <h4 className="text-slate-950 font-extrabold mb-6 flex items-center gap-3 text-lg">
+                        <AlertTriangle className="w-6 h-6 stroke-[2.5px]" /> Atenção Necessária
+                    </h4>
+                    <ul className="space-y-4 relative z-10">
+                        {gaps.map((item, idx) => (
+                            <li key={idx} className="flex items-start gap-4 text-slate-900 font-bold text-sm">
+                                <span className="mt-1.5 w-1.5 h-1.5 rounded-full bg-slate-950 flex-shrink-0" />
+                                {item}
+                            </li>
+                        ))}
+                    </ul>
+                </div>
+
+            </div>
+        </div>
+    );
+}
+
+
+==================================================
+FILE: frontend\src\components\HeroSection.jsx
+==================================================
+
+import React, { useRef } from 'react';
+import { Upload, FileText, ArrowRight, Loader2 } from 'lucide-react';
+import { motion } from 'framer-motion';
+
+export default function HeroSection({ onFileSelect, onVagaChange, onAnalyze, files, loading }) {
+    const fileInputRef = useRef(null);
+
+    const handleFileChange = (e) => {
+        if (e.target.files && e.target.files.length > 0) {
+            // Passa o evento ou os arquivos diretamente, dependendo do contrato. 
+            // O App.jsx espera o evento no handled proposto? 
+            // O prompt diz: "const handleFileSelect = (e) => { ... }" setando array.
+            // Então aqui vamos passar o evento original para manter a assinatura esperada pelo pai.
+            onFileSelect(e);
+        }
+    };
+
+    return (
+        <div className="relative overflow-hidden bg-slate-900 rounded-3xl p-8 shadow-2xl border border-slate-800">
+            {/* Background Glow */}
+            <div className="absolute top-0 right-0 -mr-20 -mt-20 w-80 h-80 bg-brand-neon/10 rounded-full blur-[100px]" />
+
+            <div className="relative z-10 flex flex-col md:flex-row gap-8 items-center">
+                {/* Left: Content */}
+                <div className="flex-1 space-y-6">
+                    <motion.div
+                        initial={{ opacity: 0, y: 20 }}
+                        animate={{ opacity: 1, y: 0 }}
+                        className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-slate-800 border border-slate-700 text-brand-neon text-sm font-medium"
+                    >
+                        <span className="relative flex h-2 w-2">
+                            <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-brand-neon opacity-75"></span>
+                            <span className="relative inline-flex rounded-full h-2 w-2 bg-brand-neon"></span>
+                        </span>
+                        Enterprise AI Screening v3.0
+                    </motion.div>
+
+                    <h1 className="text-5xl md:text-6xl font-bold text-white tracking-tighter leading-tight">
+                        Triagem Inteligente <br />
+                        <span className="text-transparent bg-clip-text bg-gradient-to-r from-brand-neon to-emerald-400">
+                            de Talentos
+                        </span>
+                    </h1>
+
+                    <p className="text-slate-400 text-lg max-w-md">
+                        Faça o upload de lotes de currículos, defina os requisitos e receba o ranking dos melhores candidatos em segundos.
+                    </p>
+
+                    <div className="space-y-4">
+                        {/* Vaga Input */}
+                        <div className="relative group">
+                            <div className="absolute inset-0 bg-gradient-to-r from-brand-neon/20 to-blue-600/20 rounded-xl blur opacity-0 group-hover:opacity-100 transition duration-500" />
+                            <textarea
+                                placeholder="Cole a Job Description completa (Requisitos Técnicos, Senioridade e Stack)..."
+                                className="relative w-full bg-slate-950 border border-slate-800 text-slate-300 rounded-xl p-4 focus:outline-none focus:ring-2 focus:ring-brand-neon/50 resize-none h-32"
+                                onChange={(e) => onVagaChange(e.target.value)}
+                            />
+                        </div>
+
+                        {/* Actions */}
+                        <div className="flex flex-col sm:flex-row gap-4">
+                            <input
+                                type="file"
+                                ref={fileInputRef}
+                                className="hidden"
+                                accept=".pdf"
+                                multiple
+                                onChange={handleFileChange}
+                            />
+
+                            <button
+                                onClick={() => fileInputRef.current?.click()}
+                                className={`flex items-center justify-center gap-2 px-6 py-4 rounded-xl border border-dashed border-slate-600 hover:border-brand-neon hover:bg-slate-800/50 transition-all group ${files && files.length > 0 ? 'border-brand-neon bg-brand-neon/10' : ''}`}
+                            >
+                                {files && files.length > 0 ? (
+                                    <>
+                                        <FileText className="w-5 h-5 text-brand-neon" />
+                                        <span className="text-slate-200 font-medium whitespace-nowrap">📄 {files.length} currículos selecionados</span>
+                                    </>
+                                ) : (
+                                    <>
+                                        <Upload className="w-5 h-5 text-slate-400 group-hover:text-brand-neon" />
+                                        <span className="text-slate-400 group-hover:text-slate-200">Upload PDFs</span>
+                                    </>
+                                )}
+                            </button>
+
+                            <button
+                                onClick={onAnalyze}
+                                disabled={!files || files.length === 0 || loading}
+                                className="flex-1 flex items-center justify-center gap-2 bg-brand-neon hover:bg-lime-300 active:scale-95 text-slate-900 font-bold py-4 px-8 rounded-full transition-all transform disabled:opacity-50 disabled:cursor-not-allowed shadow-[0_0_30px_rgba(163,230,53,0.3)] hover:shadow-[0_0_50px_rgba(163,230,53,0.5)]"
+                            >
+                                {loading ? (
+                                    <Loader2 className="w-5 h-5 animate-spin" />
+                                ) : (
+                                    <>
+                                        Processar Lote
+                                        <ArrowRight className="w-5 h-5" />
+                                    </>
+                                )}
+                            </button>
+                        </div>
+                    </div>
+                </div>
+
+                {/* Right: Illustration (Ranked List Mockup) */}
+                <div className="hidden md:flex flex-1 justify-center items-center relative">
+                    <div className="relative w-72 bg-slate-900 rounded-2xl border border-slate-700 shadow-2xl p-6 transform rotate-[-3deg]">
+                        {/* Header do Mockup */}
+                        <div className="flex justify-between items-center mb-6 border-b border-slate-800 pb-4">
+                            <span className="text-slate-400 text-xs uppercase tracking-wider">Top Candidates</span>
+                            <span className="text-brand-neon text-xs font-bold">AI Ranking</span>
+                        </div>
+
+                        {/* Lista de Candidatos */}
+                        <div className="space-y-4">
+                            {/* Candidato 1 */}
+                            <div className="flex items-center gap-3 p-2 bg-slate-800/50 rounded-lg border border-brand-neon/30">
+                                <div className="w-8 h-8 rounded-full bg-brand-neon/20 flex items-center justify-center text-brand-neon text-xs font-bold">AS</div>
+                                <div className="flex-1">
+                                    <div className="h-2 w-20 bg-slate-600 rounded mb-1"></div>
+                                    <div className="h-1.5 w-12 bg-slate-700 rounded"></div>
+                                </div>
+                                <span className="text-brand-neon font-bold text-sm">98%</span>
+                            </div>
+
+                            {/* Candidato 2 */}
+                            <div className="flex items-center gap-3 p-2">
+                                <div className="w-8 h-8 rounded-full bg-slate-700 flex items-center justify-center text-slate-400 text-xs">JS</div>
+                                <div className="flex-1">
+                                    <div className="h-2 w-16 bg-slate-700 rounded mb-1"></div>
+                                    <div className="h-1.5 w-10 bg-slate-800 rounded"></div>
+                                </div>
+                                <span className="text-blue-500 font-bold text-sm">85%</span>
+                            </div>
+
+                            {/* Candidato 3 (Adicionado conforme instructions) */}
+                            <div className="flex items-center gap-3 p-2">
+                                <div className="w-8 h-8 rounded-full bg-slate-700 flex items-center justify-center text-slate-400 text-xs">CM</div>
+                                <div className="flex-1">
+                                    <div className="h-2 w-14 bg-slate-700 rounded mb-1"></div>
+                                    <div className="h-1.5 w-8 bg-slate-800 rounded"></div>
+                                </div>
+                                <span className="text-slate-500 font-bold text-sm">71%</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    );
+}
+
+
+==================================================
+FILE: frontend\src\components\ProtectedRoute.jsx
+==================================================
+
+import React from 'react';
+import { Navigate } from 'react-router-dom';
+import { useAuth } from '../context/AuthContext';
+
+const ProtectedRoute = ({ children }) => {
+    const { user } = useAuth();
+
+    if (!user) {
+        return <Navigate to="/login" replace />;
+    }
+
+    return children;
+};
+
+export default ProtectedRoute;
+
+
+==================================================
+FILE: frontend\src\components\ScoreGauge.jsx
+==================================================
+
+import React from 'react';
+import { motion } from 'framer-motion';
+
+export default function ScoreGauge({ score }) {
+    // SVG Config
+    const radius = 80;
+    const stroke = 12;
+    const normalizedRadius = radius - stroke * 2;
+    const circumference = normalizedRadius * 2 * Math.PI;
+    const strokeDashoffset = circumference - (score / 100) * circumference;
+
+    return (
+        <div className="flex flex-col items-center justify-center p-8 bg-slate-900 rounded-3xl border border-slate-800 shadow-2xl relative overflow-hidden group hover:border-slate-700 transition-colors">
+            {/* Ambient Glow */}
+            <div className="absolute inset-0 bg-brand-neon/5 blur-3xl opacity-0 group-hover:opacity-100 transition-opacity duration-700" />
+
+            <div className="relative flex items-center justify-center">
+                <svg
+                    height={radius * 2}
+                    width={radius * 2}
+                    className="transform -rotate-90 drop-shadow-[0_0_10px_rgba(163,230,53,0.3)]"
+                >
+                    {/* Background Ring */}
+                    <circle
+                        stroke="#0f172a" // slate-900 (track needs to be darker/integrated)
+                        strokeWidth={15}
+                        fill="transparent"
+                        r={normalizedRadius}
+                        cx={radius}
+                        cy={radius}
+                        className="opacity-50"
+                    />
+                    <circle
+                        stroke="#1e293b" // slate-800 (visible track)
+                        strokeWidth={15}
+                        fill="transparent"
+                        r={normalizedRadius}
+                        cx={radius}
+                        cy={radius}
+                    />
+                    {/* Progress Ring */}
+                    <motion.circle
+                        stroke="#a3e635" // brand-neon
+                        strokeWidth={15}
+                        strokeDasharray={circumference + ' ' + circumference}
+                        style={{ strokeDashoffset }}
+                        strokeLinecap="round"
+                        fill="transparent"
+                        r={normalizedRadius}
+                        cx={radius}
+                        cy={radius}
+                        initial={{ strokeDashoffset: circumference }}
+                        animate={{ strokeDashoffset }}
+                        transition={{ duration: 1.5, ease: "easeOut" }}
+                    />
+                </svg>
+                <div className="absolute inset-0 flex flex-col items-center justify-center">
+                    <motion.span
+                        className="text-4xl font-bold text-white tracking-tighter"
+                        initial={{ opacity: 0, scale: 0.5 }}
+                        animate={{ opacity: 1, scale: 1 }}
+                        transition={{ delay: 0.5, type: "spring" }}
+                    >
+                        {score}%
+                    </motion.span>
+                    <span className="text-xs text-brand-neon font-bold uppercase tracking-[0.2em] mt-1">Match</span>
+                </div>
+            </div>
+            <h3 className="mt-6 text-slate-300 font-medium text-lg">Aderência à Vaga</h3>
+        </div>
+    );
+}
+
+
+==================================================
+FILE: frontend\src\components\SkillBars.jsx
+==================================================
+
+import React from 'react';
+import { motion } from 'framer-motion';
+
+export default function SkillBars({ technical, seniority, differential }) {
+    const metrics = [
+        { label: "Hard Skills", value: technical, max: 50, color: "bg-brand-accent" },
+        { label: "Senioridade", value: seniority, max: 30, color: "bg-purple-500" },
+        { label: "Diferenciais", value: differential, max: 20, color: "bg-pink-500" },
+    ];
+
+    return (
+        <div className="flex flex-col justify-center gap-8 p-8 bg-slate-900 rounded-3xl border border-slate-800 shadow-2xl h-full">
+            {metrics.map((metric, index) => {
+                const percentage = (metric.value / metric.max) * 100;
+
+                return (
+                    <div key={metric.label} className="w-full space-y-3">
+                        <div className="flex justify-between items-end">
+                            <span className="text-sm font-semibold text-slate-400 uppercase tracking-wider">{metric.label}</span>
+                            <div className="flex items-baseline gap-1">
+                                <span className="text-xl font-bold text-white">{metric.value}</span>
+                                <span className="text-sm text-slate-600 font-medium">/{metric.max}</span>
+                            </div>
+                        </div>
+                        <div className="w-full bg-slate-950 rounded-full h-3 p-[2px] shadow-inner border border-slate-800/50">
+                            <motion.div
+                                className={`h-full rounded-full ${metric.color} shadow-[0_0_10px_currentColor]`}
+                                initial={{ width: 0 }}
+                                animate={{ width: `${percentage}%` }}
+                                transition={{ duration: 1, delay: index * 0.2, type: "spring" }}
+                            />
+                        </div>
+                    </div>
+                );
+            })}
+        </div>
+    );
+}
+
+
+==================================================
+FILE: frontend\src\context\AuthContext.jsx
+==================================================
+
+import React, { createContext, useState, useEffect, useContext } from 'react';
+import axios from 'axios';
+
+const AuthContext = createContext();
+
+export const AuthProvider = ({ children }) => {
+    const [user, setUser] = useState(null);
+    const [loading, setLoading] = useState(true);
+
+    useEffect(() => {
+        const checkUser = async () => {
+            const token = localStorage.getItem('token');
+            if (token) {
+                axios.defaults.headers.common['Authorization'] = `Bearer ${token}`;
+                try {
+                    const res = await axios.get('http://127.0.0.1:8000/api/v1/auth/me');
+                    setUser({ token, ...res.data });
+                } catch (err) {
+                    console.error("Sessão inválida:", err);
+                    logout(); // Token expirado ou inválido
+                }
+            }
+            setLoading(false);
+        };
+        checkUser();
+    }, []);
+
+    const login = async (email, password) => {
+        try {
+            const response = await axios.post('http://127.0.0.1:8000/api/v1/auth/login', {
+                username: email, // FastAPI OAuth2PasswordRequestForm expects 'username'
+                password: password
+            }, {
+                headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
+            });
+
+            const { access_token } = response.data;
+            localStorage.setItem('token', access_token);
+            axios.defaults.headers.common['Authorization'] = `Bearer ${access_token}`;
+            setUser({ token: access_token, email });
+            return true;
+        } catch (error) {
+            console.error("Login failed:", error);
+            throw error;
+        }
+    };
+
+    const signup = async (email, password, empresa) => {
+        try {
+            await axios.post('http://127.0.0.1:8000/api/v1/auth/signup', {
+                email,
+                password,
+                nome_empresa: empresa
+            });
+            return true;
+        } catch (error) {
+            console.error("Signup failed:", error);
+            throw error;
+        }
+    };
+
+    const logout = () => {
+        localStorage.removeItem('token');
+        delete axios.defaults.headers.common['Authorization'];
+        setUser(null);
+    };
+
+    return (
+        <AuthContext.Provider value={{ user, login, signup, logout, loading }}>
+            {!loading && children}
+        </AuthContext.Provider>
+    );
+};
+
+export const useAuth = () => useContext(AuthContext);
+
+
+==================================================
+FILE: frontend\src\pages\AnalyticsDashboard.jsx
+==================================================
+
+import React, { useMemo, useState, useEffect } from 'react';
+import { LineChart, Line, BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Area, AreaChart } from 'recharts';
+import axios from 'axios';
+import { Link } from 'react-router-dom';
+import { ArrowLeft } from 'lucide-react';
+import { useAuth } from '../context/AuthContext';
+
+export default function AnalyticsDashboard() {
+    const { user } = useAuth();
+    const [rawData, setRawData] = useState([]);
+    const [year, setYear] = useState(2025);
+    const [startMonth, setStartMonth] = useState(1);
+    const [endMonth, setEndMonth] = useState(12);
+    const [loading, setLoading] = useState(true);
+
+    // 1. Fetch Full Data
+    useEffect(() => {
+        axios.get('http://127.0.0.1:8000/api/v1/dashboard/metrics')
+            .then(res => {
+                setRawData(res.data.all_records || []);
+                setLoading(false);
+            })
+            .catch(err => {
+                console.error("Erro ao buscar dados analytics:", err);
+                setLoading(false);
+            });
+    }, []);
+
+    // 2. Client-Side Processing
+    const processedData = useMemo(() => {
+        if (!rawData.length) return { monthly: [], byRole: [], bySeniority: [], kpi: {}, filtered: [] };
+
+        // Validar Range
+        const safeStart = Math.min(startMonth, endMonth);
+        const safeEnd = Math.max(startMonth, endMonth);
+
+        const filtered = rawData.filter(d => {
+            if (!d.data_analise) return false;
+            const date = new Date(d.data_analise);
+            const month = date.getMonth() + 1;
+            return date.getFullYear() === year && (month >= safeStart && month <= safeEnd);
+        });
+
+        // KPI Calc
+        const total = filtered.length;
+        const avgScore = total ? (filtered.reduce((acc, cur) => acc + (cur.score_aderencia || 0), 0) / total).toFixed(1) : 0;
+        const approved = filtered.filter(d => (d.score_aderencia || 0) >= 80).length;
+        const approvalRate = total ? ((approved / total) * 100).toFixed(1) : 0;
+
+        // Monthly Grouping
+        const monthlyData = Array.from({ length: 12 }, (_, i) => {
+            const monthNum = i + 1;
+            // Mostra apenas meses dentro do range selecionado no gráfico?
+            // O usuário pediu slicer de intervalo. Vamos filtrar o gráfico também ou mostrar tudo vazio?
+            // Geralmente dashboards mostram apenas o período filtrado.
+            if (monthNum < safeStart || monthNum > safeEnd) return null;
+
+            const monthRecs = filtered.filter(d => new Date(d.data_analise).getMonth() + 1 === monthNum);
+            const count = monthRecs.length;
+            const avg = count ? (monthRecs.reduce((a, b) => a + (b.score_aderencia || 0), 0) / count).toFixed(1) : 0;
+            return {
+                name: new Date(0, i).toLocaleString('default', { month: 'short' }),
+                count,
+                score: parseFloat(avg)
+            };
+        }).filter(Boolean); // Remove meses fora do range
+
+        // Grouping by Role (Cargo) - Top 5
+        const roleStats = filtered.reduce((acc, cur) => {
+            const role = cur.cargo_alvo || "Desconhecido";
+            if (!acc[role]) acc[role] = { count: 0, sumScore: 0 };
+            acc[role].count += 1;
+            acc[role].sumScore += (cur.score_aderencia || 0);
+            return acc;
+        }, {});
+
+        const byRole = Object.entries(roleStats)
+            .map(([role, stats]) => ({
+                role,
+                count: stats.count,
+                avg: (stats.sumScore / stats.count).toFixed(1)
+            }))
+            .sort((a, b) => b.count - a.count)
+            .slice(0, 5);
+
+        // Grouping by Seniority
+        const senStats = filtered.reduce((acc, cur) => {
+            const sen = cur.nivel_senioridade || "N/A";
+            if (!acc[sen]) acc[sen] = { count: 0, sumScore: 0 };
+            acc[sen].count += 1;
+            acc[sen].sumScore += (cur.score_aderencia || 0);
+            return acc;
+        }, {});
+
+        const bySeniority = Object.entries(senStats)
+            .map(([sen, stats]) => ({
+                seniority: sen,
+                count: stats.count,
+                avg: (stats.sumScore / stats.count).toFixed(1)
+            }))
+            .sort((a, b) => b.avg - a.avg);
+
+        return { kpi: { total, avgScore, approvalRate }, filtered, monthly: monthlyData, byRole, bySeniority };
+    }, [rawData, year, startMonth, endMonth]);
+
+    const renderClassificacao = (score) => {
+        if (score >= 90) return <span className="text-yellow-400 font-bold flex items-center gap-1">⭐ Elite</span>;
+        if (score >= 80) return <span className="text-blue-400 font-medium">✅ Qualificado</span>;
+        return <span className="text-slate-500">Em Desenvolvimento</span>;
+    };
+
+    const months = [
+        { v: 1, l: 'Jan' }, { v: 2, l: 'Fev' }, { v: 3, l: 'Mar' }, { v: 4, l: 'Abr' },
+        { v: 5, l: 'Mai' }, { v: 6, l: 'Jun' }, { v: 7, l: 'Jul' }, { v: 8, l: 'Ago' },
+        { v: 9, l: 'Set' }, { v: 10, l: 'Out' }, { v: 11, l: 'Nov' }, { v: 12, l: 'Dez' }
+    ];
+
+    if (loading) return <div className="min-h-screen bg-[#0B1120] flex items-center justify-center text-white">Carregando Analytics...</div>;
+
+    return (
+        <div className="min-h-screen bg-[#0B1120] text-white p-6 font-sans">
+            {/* Header & Filters */}
+            <div className="flex flex-col md:flex-row justify-between items-center mb-8 bg-slate-800/50 p-4 rounded-xl border border-slate-700 gap-4">
+
+                <div className="flex items-center gap-4">
+                    <Link to="/" className="p-2 hover:bg-slate-700 rounded-full transition-colors text-slate-400 hover:text-white">
+                        <ArrowLeft size={24} />
+                    </Link>
+                    <div>
+                        <h1 className="text-2xl font-semibold">Analytics | <span className="text-slate-400">Visão Geral</span></h1>
+                        {user && <span className="text-xs text-slate-500">Logado como: {user.email}</span>}
+                    </div>
+                </div>
+
+                <div className="flex flex-wrap gap-6 items-center">
+                    <div className="flex flex-col w-32">
+                        <span className="text-xs text-slate-400 mb-1">Ano: {year}</span>
+                        <input
+                            type="range"
+                            min="2024"
+                            max="2026"
+                            value={year}
+                            onChange={e => setYear(Number(e.target.value))}
+                            className="accent-blue-500 cursor-pointer h-1 bg-slate-700 rounded-lg appearance-none"
+                        />
+                    </div>
+
+                    {/* Intervalo de Meses */}
+                    <div className="flex items-center gap-2">
+                        <div className="flex flex-col">
+                            <span className="text-xs text-slate-400 mb-1">De:</span>
+                            <select
+                                value={startMonth}
+                                onChange={e => setStartMonth(Number(e.target.value))}
+                                className="bg-slate-900 border border-slate-700 text-white text-sm rounded-lg focus:ring-blue-500 focus:border-blue-500 p-1.5"
+                            >
+                                {months.map(m => <option key={m.v} value={m.v}>{m.l}</option>)}
+                            </select>
+                        </div>
+                        <span className="text-slate-500 mt-5">-</span>
+                        <div className="flex flex-col">
+                            <span className="text-xs text-slate-400 mb-1">Até:</span>
+                            <select
+                                value={endMonth}
+                                onChange={e => setEndMonth(Number(e.target.value))}
+                                className="bg-slate-900 border border-slate-700 text-white text-sm rounded-lg focus:ring-blue-500 focus:border-blue-500 p-1.5"
+                            >
+                                {months.map(m => <option key={m.v} value={m.v}>{m.l}</option>)}
+                            </select>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            {/* Main Grid Layout */}
+            <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+
+                {/* LEFT COLUMN - Charts & KPIs */}
+                <div className="lg:col-span-2 space-y-6 flex flex-col">
+                    {/* KPI ROW */}
+                    <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                        <KPICard title="Média Score" value={processedData.kpi.avgScore || 0} />
+                        <KPICard title="Total Candidatos" value={processedData.kpi.total || 0} />
+                        <KPICard title="Aprovação" value={`${processedData.kpi.approvalRate || 0}%`} />
+                    </div>
+
+                    {/* CHART: Média Score por Mês */}
+                    <div className="bg-slate-800 p-5 rounded-xl border border-slate-700 shadow-lg">
+                        <h3 className="text-sm font-semibold mb-4 text-slate-200">Tendência de Score</h3>
+                        <div className="h-64">
+                            <ResponsiveContainer width="100%" height="100%">
+                                <AreaChart data={processedData.monthly}>
+                                    <defs>
+                                        <linearGradient id="colorScore" x1="0" y1="0" x2="0" y2="1">
+                                            <stop offset="5%" stopColor="#3b82f6" stopOpacity={0.3} />
+                                            <stop offset="95%" stopColor="#3b82f6" stopOpacity={0} />
+                                        </linearGradient>
+                                    </defs>
+                                    <CartesianGrid vertical={false} stroke="#334155" strokeDasharray="3 3" />
+                                    <XAxis dataKey="name" stroke="#94a3b8" tick={{ fontSize: 12 }} />
+                                    <YAxis stroke="#94a3b8" domain={[0, 100]} tick={{ fontSize: 12 }} />
+                                    <Tooltip contentStyle={{ backgroundColor: '#1e293b', borderColor: '#334155', color: '#fff' }} />
+                                    <Area type="monotone" dataKey="score" stroke="#3b82f6" fillOpacity={1} fill="url(#colorScore)" strokeWidth={2} />
+                                </AreaChart>
+                            </ResponsiveContainer>
+                        </div>
+                    </div>
+
+                    {/* CHART: Total Candidatos por Mês */}
+                    <div className="bg-slate-800 p-5 rounded-xl border border-slate-700 shadow-lg">
+                        <h3 className="text-sm font-semibold mb-4 text-slate-200">Volume de Candidatos</h3>
+                        <div className="h-80">
+                            <ResponsiveContainer width="100%" height="100%">
+                                <BarChart data={processedData.monthly}>
+                                    <CartesianGrid vertical={false} stroke="#334155" />
+                                    <XAxis dataKey="name" stroke="#94a3b8" tick={{ fontSize: 12 }} />
+                                    <YAxis stroke="#94a3b8" allowDecimals={false} tick={{ fontSize: 12 }} />
+                                    <Tooltip contentStyle={{ backgroundColor: '#1e293b', borderColor: '#334155', color: '#fff' }} cursor={{ fill: 'transparent' }} />
+                                    <Bar dataKey="count" fill="#2563eb" radius={[4, 4, 0, 0]} barSize={40} />
+                                </BarChart>
+                            </ResponsiveContainer>
+                        </div>
+                    </div>
+                </div>
+
+                {/* RIGHT COLUMN - Tables */}
+                <div className="space-y-6 flex flex-col">
+                    <MiniTable
+                        title="Top Cargos"
+                        data={processedData.byRole}
+                        cols={[{ h: 'Cargo', k: 'role' }, { h: 'Média', k: 'avg' }, { h: 'Qtde', k: 'count' }]}
+                    />
+                    <MiniTable
+                        title="Senioridade"
+                        data={processedData.bySeniority}
+                        cols={[{ h: 'Nível', k: 'seniority' }, { h: 'Média', k: 'avg' }, { h: 'Qtde', k: 'count' }]}
+                    />
+
+                    <div className="bg-slate-800 rounded-xl border border-slate-700 flex flex-col shadow-lg overflow-hidden h-[420px]">
+                        <div className="p-4 border-b border-slate-700 bg-slate-800">
+                            <h3 className="font-semibold text-slate-200">Ranking Detalhado</h3>
+                        </div>
+                        <div className="overflow-auto flex-1 p-0 custom-scrollbar relative">
+                            <table className="w-full text-xs text-left text-slate-300">
+                                <thead className="text-slate-500 uppercase bg-slate-900 sticky top-0 z-10 shadow-sm">
+                                    <tr>
+                                        <th className="p-3 font-semibold">Nome</th>
+                                        <th className="p-3 font-semibold">Cargo</th>
+                                        <th className="p-3 text-center font-semibold">Score</th>
+                                        <th className="p-3 font-semibold">Status</th>
+                                    </tr>
+                                </thead>
+                                <tbody className="divide-y divide-slate-700/50">
+                                    {processedData.filtered.map((c, i) => (
+                                        <tr key={i} className="hover:bg-slate-700/50 transition-colors">
+                                            <td className="p-3 font-medium text-white max-w-[140px] truncate" title={c.nome_candidato}>
+                                                {c.nome_candidato}
+                                            </td>
+                                            <td className="p-3 text-slate-400 text-xs max-w-[120px] truncate" title={c.cargo_alvo}>
+                                                {c.cargo_alvo}
+                                            </td>
+                                            <td className="p-3 font-bold text-center">{c.score_aderencia}</td>
+                                            <td className="p-3">{renderClassificacao(c.score_aderencia)}</td>
+                                        </tr>
+                                    ))}
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+
+            </div>
+        </div>
+    );
+}
+
+// Sub-componentes
+function KPICard({ title, value }) {
+    return (
+        <div className="bg-slate-800 p-6 rounded-xl border border-slate-700 flex flex-col items-center justify-center text-center shadow-md hover:border-slate-600 transition-colors">
+            <span className="text-3xl font-bold text-white mb-1">{value}</span>
+            <span className="text-slate-400 text-xs uppercase tracking-wider">{title}</span>
+        </div>
+    );
+}
+
+function MiniTable({ title, data, cols }) {
+    return (
+        <div className="bg-slate-800 p-4 rounded-xl border border-slate-700 shadow-md">
+            <h3 className="text-sm font-semibold mb-3 text-slate-200">{title}</h3>
+            <div className="overflow-x-auto custom-scrollbar">
+                <table className="w-full text-xs text-left text-slate-300">
+                    <thead className="text-slate-500 border-b border-slate-700 bg-slate-800">
+                        <tr>
+                            {cols.map((col, i) => <th key={i} className="pb-2 font-semibold">{col.h}</th>)}
+                        </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-700/30">
+                        {data.map((row, i) => (
+                            <tr key={i}>
+                                {cols.map((col, j) => (
+                                    <td key={j} className="py-2.5 text-slate-300">
+                                        {j === 0 ? <span className="font-medium text-white">{row[col.k]}</span> : row[col.k]}
+                                    </td>
+                                ))}
+                            </tr>
+                        ))}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    );
+}
+
+
+==================================================
+FILE: frontend\src\pages\Dashboard.jsx
+==================================================
+
+import React, { useState } from 'react';
+import axios from 'axios';
+import { motion, AnimatePresence } from 'framer-motion';
+import { Link } from 'react-router-dom';
+import { useAuth } from '../context/AuthContext';
+import HeroSection from '../components/HeroSection';
+import ScoreGauge from '../components/ScoreGauge';
+import SkillBars from '../components/SkillBars';
+import BentoGrid from '../components/BentoGrid';
+
+export default function Dashboard() {
+    const { logout, user } = useAuth();
+    const [files, setFiles] = useState([]);
+    const [vaga, setVaga] = useState('');
+    const [result, setResult] = useState(null);
+    const [loading, setLoading] = useState(false);
+    const [error, setError] = useState('');
+
+    const handleFileSelect = (e) => {
+        if (e.target.files && e.target.files.length > 0) {
+            setFiles(Array.from(e.target.files));
+        }
+    };
+
+    const handleAnalyze = async () => {
+        if (!files || files.length === 0) return;
+
+        setLoading(true);
+        setError('');
+
+        try {
+            let lastResult = null;
+
+            for (const file of files) {
+                const formData = new FormData();
+                formData.append('arquivo', file);
+                if (vaga) formData.append('vaga', vaga);
+
+                // Axios uses the interceptor/default header set in AuthContext
+                const response = await axios.post('http://127.0.0.1:8000/api/v1/analisar-cv/', formData);
+
+                lastResult = response.data;
+            }
+
+            setResult(lastResult);
+        } catch (err) {
+            console.error(err);
+            if (err.response && err.response.data && err.response.data.detail) {
+                setError(err.response.data.detail);
+            } else {
+                setError('Erro ao processar o lote de currículos. Verifique se o backend está rodando e se você está logado.');
+            }
+            if (err.response && err.response.status === 401) {
+                logout(); // Auto logout on 401
+            }
+        } finally {
+            setLoading(false);
+        }
+    };
+
+    return (
+        <div className="min-h-screen bg-slate-950 text-slate-100 font-sans selection:bg-brand-neon selection:text-slate-900 pb-20">
+
+            {/* Header */}
+            <header className="border-b border-slate-800 bg-slate-950/50 backdrop-blur-md sticky top-0 z-50">
+                <div className="max-w-6xl mx-auto px-4 h-16 flex items-center justify-between">
+                    <div className="flex items-center gap-2">
+                        <div className="w-8 h-8 rounded-lg bg-brand-neon flex items-center justify-center font-bold text-slate-900">
+                            CV
+                        </div>
+                        <span className="font-bold text-lg tracking-tight">Engine Pro</span>
+                    </div>
+                    <nav className="text-sm font-medium text-slate-400 flex items-center gap-6">
+                        <Link to="/analytics" className="hover:text-brand-neon transition-colors">
+                            Analytics
+                        </Link>
+                        <div className="hidden md:block">Olá, {user?.email}</div>
+                        <button onClick={logout} className="hover:text-red-400 transition-colors">
+                            Sair
+                        </button>
+                    </nav>
+                </div>
+            </header>
+
+            <main className="max-w-6xl mx-auto px-4 py-8 space-y-8">
+                {/* Hero Section */}
+                <HeroSection
+                    files={files}
+                    onFileSelect={handleFileSelect}
+                    onVagaChange={setVaga}
+                    onAnalyze={handleAnalyze}
+                    loading={loading}
+                />
+
+                {/* Error Message */}
+                {error && (
+                    <div className="bg-red-500/10 border border-red-500/50 text-red-500 p-4 rounded-xl">
+                        {error}
+                    </div>
+                )}
+
+                {/* Loading State Skeleton */}
+                {loading && !result && (
+                    <div className="space-y-6 animate-pulse">
+                        <div className="h-40 bg-slate-900 rounded-3xl" />
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                            <div className="h-60 bg-slate-900 rounded-3xl" />
+                            <div className="h-60 bg-slate-900 rounded-3xl" />
+                        </div>
+                    </div>
+                )}
+
+                {/* Results - Animate In */}
+                <AnimatePresence>
+                    {result && !loading && (
+                        <motion.div
+                            initial={{ opacity: 0, y: 40 }}
+                            animate={{ opacity: 1, y: 0 }}
+                            exit={{ opacity: 0 }}
+                            className="space-y-8"
+                        >
+                            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+                                <div className="lg:col-span-1">
+                                    <ScoreGauge score={result.match_percentual || 0} />
+                                </div>
+                                <div className="lg:col-span-2">
+                                    <SkillBars
+                                        technical={result.score_tecnico || 0}
+                                        seniority={result.score_senioridade || 0}
+                                        differential={result.score_diferencial || 0}
+                                    />
+                                </div>
+                            </div>
+
+                            <BentoGrid
+                                analysis={result.analise_comparativa}
+                                strengths={result.pontos_fortes || []}
+                                gaps={result.gaps_tecnicos || []}
+                            />
+                        </motion.div>
+                    )}
+                </AnimatePresence>
+            </main>
+        </div>
+    );
+}
+
+
+==================================================
+FILE: frontend\src\pages\Login.jsx
+==================================================
+
+import React, { useState } from 'react';
+import { useNavigate, Link } from 'react-router-dom';
+import { useAuth } from '../context/AuthContext';
+import { motion } from 'framer-motion';
+
+export default function Login() {
+    const [email, setEmail] = useState('');
+    const [password, setPassword] = useState('');
+    const [error, setError] = useState('');
+    const { login } = useAuth();
+    const navigate = useNavigate();
+
+    const handleSubmit = async (e) => {
+        e.preventDefault();
+        setError('');
+        try {
+            await login(email, password);
+            navigate('/');
+        } catch (err) {
+            setError('Falha no login. Verifique suas credenciais.');
+        }
+    };
+
+    return (
+        <div className="min-h-screen bg-slate-950 flex items-center justify-center p-4">
+            <motion.div
+                initial={{ opacity: 0, scale: 0.95 }}
+                animate={{ opacity: 1, scale: 1 }}
+                className="w-full max-w-md bg-slate-900 p-8 rounded-2xl border border-slate-800 shadow-2xl"
+            >
+                <div className="flex justify-center mb-8">
+                    <div className="w-12 h-12 rounded-xl bg-brand-neon flex items-center justify-center font-bold text-slate-900 text-xl">
+                        CV
+                    </div>
+                </div>
+
+                <h2 className="text-2xl font-bold text-center text-white mb-6">Bem-vindo de volta</h2>
+
+                {error && (
+                    <div className="bg-red-500/10 text-red-500 p-3 rounded-lg mb-4 text-sm text-center">
+                        {error}
+                    </div>
+                )}
+
+                <form onSubmit={handleSubmit} className="space-y-4">
+                    <div>
+                        <label className="block text-slate-400 text-sm mb-1">Email</label>
+                        <input
+                            type="email"
+                            required
+                            value={email}
+                            onChange={(e) => setEmail(e.target.value)}
+                            className="w-full bg-slate-950 border border-slate-800 rounded-lg p-3 text-white focus:outline-none focus:border-brand-neon transition-colors"
+                            placeholder="seu@email.com"
+                        />
+                    </div>
+                    <div>
+                        <label className="block text-slate-400 text-sm mb-1">Senha</label>
+                        <input
+                            type="password"
+                            required
+                            value={password}
+                            onChange={(e) => setPassword(e.target.value)}
+                            className="w-full bg-slate-950 border border-slate-800 rounded-lg p-3 text-white focus:outline-none focus:border-brand-neon transition-colors"
+                            placeholder="••••••••"
+                        />
+                    </div>
+                    <button
+                        type="submit"
+                        className="w-full bg-brand-neon text-slate-900 font-bold py-3 rounded-lg hover:bg-brand-neon/90 transition-colors"
+                    >
+                        Entrar
+                    </button>
+                </form>
+
+                <p className="text-center text-slate-500 text-sm mt-6">
+                    Não tem uma conta?{' '}
+                    <Link to="/signup" className="text-brand-neon hover:underline">
+                        Crie agora
+                    </Link>
+                </p>
+            </motion.div>
+        </div>
+    );
+}
+
+
+==================================================
+FILE: frontend\src\pages\Signup.jsx
+==================================================
+
+import React, { useState } from 'react';
+import { useNavigate, Link } from 'react-router-dom';
+import { useAuth } from '../context/AuthContext';
+import { motion } from 'framer-motion';
+
+export default function Signup() {
+    const [email, setEmail] = useState('');
+    const [password, setPassword] = useState('');
+    const [empresa, setEmpresa] = useState('');
+    const [error, setError] = useState('');
+    const { signup } = useAuth();
+    const navigate = useNavigate();
+
+    const handleSubmit = async (e) => {
+        e.preventDefault();
+        setError('');
+        try {
+            await signup(email, password, empresa);
+            // Opcional: Auto login ou redirecionar para login
+            navigate('/login');
+        } catch (err) {
+            setError('Erro ao criar conta. Tente outro email.');
+        }
+    };
+
+    return (
+        <div className="min-h-screen bg-slate-950 flex items-center justify-center p-4">
+            <motion.div
+                initial={{ opacity: 0, scale: 0.95 }}
+                animate={{ opacity: 1, scale: 1 }}
+                className="w-full max-w-md bg-slate-900 p-8 rounded-2xl border border-slate-800 shadow-2xl"
+            >
+                <div className="flex justify-center mb-8">
+                    <div className="w-12 h-12 rounded-xl bg-brand-neon flex items-center justify-center font-bold text-slate-900 text-xl">
+                        CV
+                    </div>
+                </div>
+
+                <h2 className="text-2xl font-bold text-center text-white mb-6">Criar nova conta</h2>
+
+                {error && (
+                    <div className="bg-red-500/10 text-red-500 p-3 rounded-lg mb-4 text-sm text-center">
+                        {error}
+                    </div>
+                )}
+
+                <form onSubmit={handleSubmit} className="space-y-4">
+                    <div>
+                        <label className="block text-slate-400 text-sm mb-1">Nome da Empresa</label>
+                        <input
+                            type="text"
+                            required
+                            value={empresa}
+                            onChange={(e) => setEmpresa(e.target.value)}
+                            className="w-full bg-slate-950 border border-slate-800 rounded-lg p-3 text-white focus:outline-none focus:border-brand-neon transition-colors"
+                            placeholder="Tech Corp"
+                        />
+                    </div>
+                    <div>
+                        <label className="block text-slate-400 text-sm mb-1">Email</label>
+                        <input
+                            type="email"
+                            required
+                            value={email}
+                            onChange={(e) => setEmail(e.target.value)}
+                            className="w-full bg-slate-950 border border-slate-800 rounded-lg p-3 text-white focus:outline-none focus:border-brand-neon transition-colors"
+                            placeholder="seu@email.com"
+                        />
+                    </div>
+                    <div>
+                        <label className="block text-slate-400 text-sm mb-1">Senha</label>
+                        <input
+                            type="password"
+                            required
+                            value={password}
+                            onChange={(e) => setPassword(e.target.value)}
+                            className="w-full bg-slate-950 border border-slate-800 rounded-lg p-3 text-white focus:outline-none focus:border-brand-neon transition-colors"
+                            placeholder="••••••••"
+                        />
+                    </div>
+                    <button
+                        type="submit"
+                        className="w-full bg-brand-neon text-slate-900 font-bold py-3 rounded-lg hover:bg-brand-neon/90 transition-colors"
+                    >
+                        Cadastrar
+                    </button>
+                </form>
+
+                <p className="text-center text-slate-500 text-sm mt-6">
+                    Já tem uma conta?{' '}
+                    <Link to="/login" className="text-brand-neon hover:underline">
+                        Faça login
+                    </Link>
+                </p>
+            </motion.div>
+        </div>
+    );
+}
+
+
+==================================================
+FILE: scripts\sync_code.py
+==================================================
+
+import os
+
+# Configurações
+SOURCE_DIRS = [
+    "src",
+    "frontend/src",
+    "scripts",
+    ".",  # Raiz (para main.py, etc)
+]
+
+# Extensões para incluir
+INCLUDE_EXTENSIONS = {
+    ".py", ".js", ".jsx", ".css", ".html", ".md", ".json", ".sql"
+}
+
+# Pastas para ignorar
+IGNORE_DIRS = {
+    "node_modules", ".venv", "__pycache__", ".git", ".idea", "dist", "build", "txt-files", "coverage", "brain", ".gemini"
+}
+
+# Arquivos específicos para ignorar
+IGNORE_FILES = {
+    "package-lock.json", "dicionario_competencias.json", "dados_bi.xlsx", "dados_bi_mock.xlsx", "project_bundle.txt"
+}
+
+OUTPUT_FILE = "project_bundle.txt"
+
+def should_process(file_path):
+    # Verifica extensão
+    _, ext = os.path.splitext(file_path)
+    if ext not in INCLUDE_EXTENSIONS:
+        return False
+    
+    filename = os.path.basename(file_path)
+    if filename in IGNORE_FILES:
+        return False
+        
+    return True
+
+def sync_files():
+    base_path = os.getcwd()
+    output_path = os.path.join(base_path, OUTPUT_FILE)
+    
+    count = 0
+    
+    with open(output_path, "w", encoding="utf-8") as f_out:
+        f_out.write(f"# PROJECT CODEBASE BUNDLE\n")
+        f_out.write(f"# Contém todo o código fonte do projeto concatenado.\n\n")
+
+        # Set para rastrear arquivos já processados e evitar duplicidade
+        processed_files = set()
+
+        for relative_start_dir in SOURCE_DIRS:
+            start_path = os.path.join(base_path, relative_start_dir)
+            
+            if not os.path.exists(start_path):
+                print(f"Aviso: Diretório fonte '{start_path}' não encontrado.")
+                continue
+                
+            print(f"Processando diretório: {relative_start_dir}")
+
+            for root, dirs, files in os.walk(start_path):
+                # Filtra diretórios ignorados in-place
+                dirs[:] = [d for d in dirs if d not in IGNORE_DIRS]
+                
+                for file in files:
+                    file_path = os.path.join(root, file)
+                    
+                    if should_process(file_path):
+                        # Caminho relativo para o header/identificação
+                        rel_path = os.path.relpath(file_path, base_path)
+                        
+                        # Evita processar o próprio bundle
+                        if rel_path == OUTPUT_FILE:
+                            continue
+                        
+                        # Evita duplicidade (ex: '.' inclui 'src', então 'src/api.py' apareceria 2x)
+                        if rel_path in processed_files:
+                            continue
+
+                        try:
+                            with open(file_path, "r", encoding="utf-8") as f_in:
+                                content = f_in.read()
+                                
+                            f_out.write(f"\n{'='*50}\n")
+                            f_out.write(f"FILE: {rel_path}\n")
+                            f_out.write(f"{'='*50}\n\n")
+                            f_out.write(content)
+                            f_out.write("\n")
+                            
+                            print(f"Adicionado: {rel_path}")
+                            processed_files.add(rel_path)
+                            count += 1
+                            
+                        except Exception as e:
+                            print(f"Erro ao processar {file}: {e}")
+                            
+    print(f"\nConcluído! {count} arquivos unificados em '{OUTPUT_FILE}'.")
+
+if __name__ == "__main__":
+    sync_files()
+
+
+==================================================
+FILE: scripts\sync_to_txt.py
+==================================================
+
+import os
+import shutil
+from pathlib import Path
+
+# Configuration
+SOURCE_DIRS = [
+    Path("src"),
+    Path("frontend/src"),
+    Path("."),  # Root for main.py etc.
+]
+TARGET_DIR = Path("txt-files")
+EXTENSIONS = {".py", ".jsx", ".js", ".css", ".md", ".html"}
+IGNORE_DIRS = {"node_modules", ".venv", "__pycache__", ".git", "dist", "coverage"}
+IGNORE_FILES = {"package-lock.json", "yarn.lock"}
+
+def should_process(file_path: Path) -> bool:
+    if file_path.name in IGNORE_FILES:
+        return False
+    # Check if any parent part is in IGNORE_DIRS
+    for part in file_path.parts:
+        if part in IGNORE_DIRS:
+            return False
+    return file_path.suffix in EXTENSIONS
+
+def get_target_path(source_file: Path, target_dir: Path) -> Path:
+    """
+    Determines the target path.
+    1. Checks if 'stem.txt' exists (legacy mapping).
+    2. Defaults to 'filename.txt'.
+    """
+    legacy_name = target_dir / f"{source_file.stem}.txt"
+    if legacy_name.exists():
+        return legacy_name
+    
+    # New convention: preserve extension for clarity (e.g., App.jsx.txt)
+    return target_dir / f"{source_file.name}.txt"
+
+def sync_files():
+    if not TARGET_DIR.exists():
+        TARGET_DIR.mkdir(parents=True)
+        print(f"Created directory: {TARGET_DIR}")
+
+    count = 0
+    updated = 0
+    
+    for src_dir in SOURCE_DIRS:
+        if not src_dir.exists():
+            continue
+            
+        # Handle root specially to avoid recursive walk into all ignore dirs
+        if src_dir == Path("."):
+            iterator = (p for p in src_dir.iterdir() if p.is_file())
+        else:
+            iterator = src_dir.rglob("*")
+
+        for file_path in iterator:
+            if not file_path.is_file():
+                continue
+            
+            if not should_process(file_path):
+                continue
+
+            target_path = get_target_path(file_path, TARGET_DIR)
+            
+            try:
+                content = file_path.read_text(encoding='utf-8', errors='ignore')
+                
+                # Add header for context
+                header = f"# Source: {file_path.as_posix()}\n# Timestamp: {os.path.getmtime(file_path)}\n\n"
+                full_content = header + content
+                
+                # Write if changed or new
+                if not target_path.exists() or target_path.read_text(encoding='utf-8', errors='ignore') != full_content:
+                    target_path.write_text(full_content, encoding='utf-8')
+                    updated += 1
+                
+                count += 1
+            except Exception as e:
+                print(f"Error processing {file_path}: {e}")
+
+    print(f"Processed {count} files.")
+    print(f"Updated/Created {updated} files in {TARGET_DIR}")
+
+if __name__ == "__main__":
+    sync_files()
+
+
+==================================================
+FILE: scripts\verify_analytics_api.py
+==================================================
+
+import sys
+import os
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
+import requests
+import json
+from src.services.auth_handler import create_access_token, criar_usuario, buscar_usuario_por_email
+
+# Config
+BASE_URL = "http://127.0.0.1:8000/api/v1"
+TEST_EMAIL = "analytics_tester@example.com"
+
+def test_analytics_endpoint():
+    print("=== Testando Endpoint de Analytics ===")
+    
+    # 1. Garantir que usuário existe
+    if not buscar_usuario_por_email(TEST_EMAIL):
+        criar_usuario(TEST_EMAIL, "pass123", "Tester Corp")
+        print(f"✅ Usuário {TEST_EMAIL} criado.")
+    
+    # 2. Gerar Token 
+    token = create_access_token(data={"sub": TEST_EMAIL})
+    headers = {"Authorization": f"Bearer {token}"}
+    
+    try:
+        response = requests.get(f"{BASE_URL}/dashboard/metrics", headers=headers)
+        
+        if response.status_code == 200:
+            data = response.json()
+            print("✅ Requisição Sucesso (200 OK)")
+            
+            if "all_records" in data:
+                count = len(data["all_records"])
+                print(f"✅ Campo 'all_records' encontrado com {count} registros.")
+                if count > 0:
+                    print(f"   Exemplo de registro: {data['all_records'][0].keys()}")
+            else:
+                print("❌ ERRO: Campo 'all_records' ausente na resposta.")
+        else:
+            print(f"❌ Falha na requisição: {response.status_code} - {response.text}")
+            
+    except Exception as e:
+        print(f"❌ Erro de conexão: {e}")
+
+if __name__ == "__main__":
+    test_analytics_endpoint()
+
+
+==================================================
+FILE: scripts\verify_auth.py
+==================================================
+
+import requests
+import uuid
+
+BASE_URL = "http://127.0.0.1:8000/api/v1"
+
+def test_auth_flow():
+    # 1. Signup
+    email = f"test_{uuid.uuid4()}@example.com"
+    password = "securepassword123"
+    empresa = "Tech Corp"
+    
+    print(f"Tentando criar usuário: {email}")
+    response = requests.post(f"{BASE_URL}/auth/signup", json={
+        "email": email,
+        "password": password,
+        "nome_empresa": empresa
+    })
+    
+    if response.status_code == 200:
+        print("✅ Signup com sucesso!")
+    else:
+        print(f"❌ Falha no Signup: {response.text}")
+        return
+
+    # 2. Login
+    print("Tentando login...")
+    response = requests.post(f"{BASE_URL}/auth/login", data={
+        "username": email,
+        "password": password
+    })
+    
+    if response.status_code == 200:
+        token = response.json().get("access_token")
+        print("✅ Login com sucesso! Token recebido.")
+    else:
+        print(f"❌ Falha no Login: {response.text}")
+        return
+
+    # 3. Access Protected Route (Dashboard Metrics)
+    print("Tentando acessar rota protegida (/dashboard/metrics)...")
+    headers = {"Authorization": f"Bearer {token}"}
+    response = requests.get(f"{BASE_URL}/dashboard/metrics", headers=headers)
+    
+    if response.status_code == 200:
+        print(f"✅ Acesso autorizado! Metrícas: {response.json()}")
+    else:
+        print(f"❌ Falha no acesso protegido: {response.text}")
+
+if __name__ == "__main__":
+    try:
+        test_auth_flow()
+    except Exception as e:
+        print(f"Erro na verificação: {e}")
+        print("Verifique se o servidor está rodando!")
+
+
+==================================================
+FILE: scripts\verify_auth_me.py
+==================================================
+
+import sys
+import os
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
+import requests
+from src.services.auth_handler import create_access_token, criar_usuario, buscar_usuario_por_email
+
+BASE_URL = "http://127.0.0.1:8000/api/v1"
+TEST_EMAIL = "me_tester@example.com"
+
+def test_auth_me():
+    print("=== Testando Endpoint /auth/me ===")
+    
+    # 1. Garantir usuário
+    if not buscar_usuario_por_email(TEST_EMAIL):
+        criar_usuario(TEST_EMAIL, "pass123", "Me Corp")
+        print(f"Usuário {TEST_EMAIL} criado.")
+    
+    # 2. Gerar Token
+    token = create_access_token(data={"sub": TEST_EMAIL})
+    
+    # 3. Request /auth/me
+    headers = {"Authorization": f"Bearer {token}"}
+    try:
+        response = requests.get(f"{BASE_URL}/auth/me", headers=headers)
+        if response.status_code == 200:
+            data = response.json()
+            print("✅ Sucesso!")
+            print(f"Email: {data.get('email')}")
+            print(f"Empresa: {data.get('empresa')}")
+            
+            if data.get('email') == TEST_EMAIL:
+                print("✅ Email corresponde.")
+                sys.exit(0)
+            else:
+                print("❌ Email incorreto.")
+                sys.exit(1)
+        else:
+            print(f"❌ Erro: {response.status_code} - {response.text}")
+            sys.exit(1)
+            
+    except Exception as e:
+        print(f"❌ Exceção: {e}")
+        sys.exit(1)
+
+if __name__ == "__main__":
+    test_auth_me()
+
+
+==================================================
+FILE: scripts\verify_security.py
+==================================================
+
+import sys
+import os
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
+import requests
+import json
+from src.services.auth_handler import create_access_token, criar_usuario, buscar_usuario_por_email
+
+BASE_URL = "http://127.0.0.1:8000/api/v1"
+TEST_EMAIL = "security_tester@example.com"
+TEST_PASS = "sec123"
+
+def run_test(name, func):
+    print(f"--- Testando: {name} ---")
+    try:
+        func()
+        print("✅ PASSOU")
+    except Exception as e:
+        print(f"❌ FALHOU: {e}")
+        # sys.exit(1) # Não para o script, roda todos
+
+def setup_user():
+    if not buscar_usuario_por_email(TEST_EMAIL):
+        criar_usuario(TEST_EMAIL, TEST_PASS, "Security Corp")
+
+def test_login_failure():
+    resp = requests.post(f"{BASE_URL}/auth/login", data={"username": TEST_EMAIL, "password": "wrong_password"})
+    if resp.status_code != 401:
+        raise Exception(f"Esperado 401, recebeu {resp.status_code}")
+
+def test_protected_route_no_token():
+    resp = requests.get(f"{BASE_URL}/dashboard/metrics")
+    if resp.status_code != 401:
+        raise Exception(f"Esperado 401, recebeu {resp.status_code}")
+
+def test_protected_route_bad_token():
+    headers = {"Authorization": "Bearer tokeninválido123"}
+    resp = requests.get(f"{BASE_URL}/dashboard/metrics", headers=headers)
+    if resp.status_code != 401:
+        raise Exception(f"Esperado 401, recebeu {resp.status_code}")
+
+def test_data_leakage():
+    # Login correto para pegar token
+    resp = requests.post(f"{BASE_URL}/auth/login", data={"username": TEST_EMAIL, "password": TEST_PASS})
+    token = resp.json()["access_token"]
+    
+    headers = {"Authorization": f"Bearer {token}"}
+    resp = requests.get(f"{BASE_URL}/auth/me", headers=headers)
+    data = resp.json()
+    
+    if "senha_hash" in data or "password" in data:
+        raise Exception("VAZAMENTO DE DADOS: Senha ou Hash retornados na API!")
+
+def test_invalid_upload():
+    # Login correto
+    resp = requests.post(f"{BASE_URL}/auth/login", data={"username": TEST_EMAIL, "password": TEST_PASS})
+    token = resp.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+    
+    # Cria arquivo fake .txt
+    files = {'arquivo': ('teste.txt', 'conteudo texto plano', 'text/plain')}
+    resp = requests.post(f"{BASE_URL}/analisar-cv/", files=files, headers=headers)
+    
+    # Esperado: 400 ou 500 (dependendo da validação do pdf_handler)
+    # O pdf_handler retorna None se não for PDF ou imagem, e a API levanta 400
+    if resp.status_code != 400:
+         raise Exception(f"Esperado 400 para arquivo inválido, recebeu {resp.status_code}. Detalhe: {resp.text}")
+
+if __name__ == "__main__":
+    setup_user()
+    run_test("Login com Senha Errada", test_login_failure)
+    run_test("Acesso sem Token", test_protected_route_no_token)
+    run_test("Acesso com Token Inválido", test_protected_route_bad_token)
+    run_test("Vazamento de Senha na API", test_data_leakage)
+    run_test("Upload de Arquivo Inválido (.txt)", test_invalid_upload)
+
+
+==================================================
+FILE: main.py
+==================================================
+
+import sys
+import os
+
+# Adiciona a pasta raiz ao path do Python para encontrar os módulos 'src'
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+
+from streamlit.web import cli as stcli
+
+if __name__ == "__main__":
+    # Truque para rodar o streamlit via python main.py
+    sys.argv = ["streamlit", "run", "src/ui/dashboard.py"]
+    sys.exit(stcli.main())
+
+==================================================
+FILE: mock_bi.py
+==================================================
+
+import pandas as pd
+import random
+from datetime import datetime, timedelta
+
+def gerar_mock_contextual(caminho_base="dados_bi.xlsx - Sheet1.csv", quantidade=200, saida="dados_bi_mock.xlsx"):
+    try:
+        df_base = pd.read_csv(caminho_base, sep=None, engine='python')
+        colunas = df_base.columns.tolist()
+    except FileNotFoundError:
+        print(f"Erro: O arquivo '{caminho_base}' não foi encontrado.")
+        return
+
+    primeiros_nomes = ["Ana", "Carlos", "Fernanda", "João", "Mariana", "Victor", "Lucas", "Beatriz", "Pedro", "Camila", "Rodrigo", "Juliana", "Rafael", "Amanda", "Bruno"]
+    sobrenomes = ["Silva", "Souza", "Lima", "Costa", "Aguiar", "Rocha", "Mendes", "Santos", "Oliveira", "Pereira", "Ferreira", "Alves", "Ribeiro", "Gomes", "Martins"]
+    vagas = ["Analista de BI Pleno", "Engenheiro de Dados", "Cientista de Dados", "Analista de Dados Senior"]
+    
+    # 1. Pré-geração de Nomes Únicos
+    nomes_gerados = set()
+    while len(nomes_gerados) < quantidade:
+        s1, s2 = random.sample(sobrenomes, 2) 
+        nome = f"{random.choice(primeiros_nomes)} {s1} {s2}"
+        nomes_gerados.add(nome)
+
+    lista_nomes_unicos = list(nomes_gerados)
+    
+    dados = []
+    
+    # 2. Definição da Janela de Tempo (01/01/2025 até o instante atual)
+    hoje = datetime.now()
+    data_inicio = datetime(2025, 1, 1)
+    segundos_totais = int((hoje - data_inicio).total_seconds())
+
+    for i in range(quantidade):
+        score = random.randint(10, 100)
+        
+        # Lógica Contextual (Senioridade vs Score)
+        if score >= 80:
+            nivel = "Senior/Especialista"
+            parecer = "Candidato apresenta excelente alinhamento com a vaga. Domínio técnico comprovado e forte bagagem."
+            gaps = "Não há gaps técnicos diretos nos requisitos explícitos da vaga."
+            skills = "Domínio avançado das ferramentas principais (SQL, Power BI/Python). Excelente capacidade analítica."
+        elif score >= 50:
+            nivel = "Pleno"
+            parecer = "Candidato possui boa base técnica, mas carece de experiência em projetos de maior escala."
+            gaps = "Falta aprofundamento em arquitetura de dados e modelagem dimensional avançada."
+            skills = "Conhecimento intermediário nas ferramentas principais. Boa capacidade de execução sob supervisão."
+        else:
+            nivel = "Júnior/Estágio"
+            parecer = "Perfil ainda em desenvolvimento. O candidato não atende aos requisitos mínimos de experiência."
+            gaps = "Ausência de conhecimento prático nas tecnologias exigidas. Necessita de forte capacitação."
+            skills = "Conceitos teóricos básicos. Familiaridade inicial e acadêmica com as ferramentas."
+
+        linha = {}
+        for col in colunas:
+            col_lower = col.lower()
+            if "data" in col_lower:
+                # Sorteia um segundo aleatório dentro da janela de tempo e soma à data de início
+                segundos_aleatorios = random.randint(0, segundos_totais)
+                data_aleatoria = data_inicio + timedelta(seconds=segundos_aleatorios)
+                linha[col] = data_aleatoria.strftime("%Y-%m-%d %H:%M:%S")
+            elif "nome" in col_lower or "candidato" in col_lower:
+                linha[col] = lista_nomes_unicos[i]
+            elif "cargo" in col_lower or "vaga" in col_lower:
+                linha[col] = random.choice(vagas)
+            elif "score" in col_lower or "aderencia" in col_lower:
+                linha[col] = score
+            elif "senioridade" in col_lower:
+                linha[col] = nivel
+            elif "gaps" in col_lower:
+                linha[col] = gaps
+            elif "parecer" in col_lower:
+                linha[col] = parecer
+            elif "skills" in col_lower or "fortes" in col_lower:
+                linha[col] = skills
+            else:
+                linha[col] = "Dado gerado"
+                
+        dados.append(linha)
+
+    df_mock = pd.DataFrame(dados)
+    
+    # Ordenação cronológica (do mais recente para o mais antigo)
+    colunas_data = [c for c in colunas if "data" in c.lower()]
+    if colunas_data:
+        df_mock = df_mock.sort_values(by=colunas_data[0], ascending=False)
+
+    df_mock.to_excel(saida, index=False, engine='openpyxl')
+    print(f"✅ Arquivo '{saida}' gerado! {quantidade} currículos com datas distribuídas entre 2025 e Hoje.")
+
+if __name__ == "__main__":
+    gerar_mock_contextual()
+
+==================================================
+FILE: bi\themes\tema_cv_engine.json
+==================================================
+
+{
+    "name": "CV Engine Dark Tech Final v2",
+    "dataColors": [
+        "#a3e635",
+        "#2563eb",
+        "#38bdf8",
+        "#818cf8",
+        "#c084fc",
+        "#f472b6",
+        "#fb7185",
+        "#4ade80"
+    ],
+    "background": "#0f172a",
+    "foreground": "#f8fafc",
+    "tableAccent": "#2563eb",
+    "visualStyles": {
+        "page": {
+            "*": {
+                "background": [
+                    {
+                        "color": {
+                            "solid": {
+                                "color": "#0f172a"
+                            }
+                        },
+                        "transparency": 0
+                    }
+                ]
+            }
+        },
+        "*": {
+            "*": {
+                "background": [
+                    {
+                        "show": true,
+                        "color": {
+                            "solid": {
+                                "color": "#1e293b"
+                            }
+                        },
+                        "transparency": 0
+                    }
+                ],
+                "border": [
+                    {
+                        "show": true,
+                        "color": {
+                            "solid": {
+                                "color": "#334155"
+                            }
+                        },
+                        "radius": 10
+                    }
+                ]
+            }
+        },
+        "outspacePane": {
+            "*": {
+                "backgroundColor": [
+                    {
+                        "solid": {
+                            "color": "#0f172a"
+                        }
+                    }
+                ],
+                "foregroundColor": [
+                    {
+                        "solid": {
+                            "color": "#f8fafc"
+                        }
+                    }
+                ],
+                "borderColor": [
+                    {
+                        "solid": {
+                            "color": "#334155"
+                        }
+                    }
+                ]
+            }
+        },
+        "filterCard": {
+            "*": {
+                "backgroundColor": [
+                    {
+                        "solid": {
+                            "color": "#1e293b"
+                        }
+                    }
+                ],
+                "foregroundColor": [
+                    {
+                        "solid": {
+                            "color": "#f8fafc"
+                        }
+                    }
+                ]
+            },
+            "$applied": {
+                "backgroundColor": [
+                    {
+                        "solid": {
+                            "color": "#2563eb"
+                        }
+                    }
+                ],
+                "foregroundColor": [
+                    {
+                        "solid": {
+                            "color": "#f8fafc"
+                        }
+                    }
+                ]
+            }
+        }
+    }
+}
+
+==================================================
+FILE: docs\prompts\task_01_exportacao_bi.md
+==================================================
+
+SYSTEM PROMPT: Implementação do Módulo de Exportação BI
+
+Role: Product Owner & Lead Data Engineer Contexto: Estamos evoluindo o CV Engine Pro para incluir uma camada de persistência. Atualmente, o sistema apenas exibe dados em tela (Streamlit). Precisamos historiar essas análises em um arquivo Excel (.xlsx) estruturado para alimentar dashboards externos (Power BI/Tableau).
+Diretrizes Globais:
+
+1. Não quebre a UI existente: O dashboard.py depende das chaves atuais dos dicionários (ex: match_percentual). A nova implementação deve ser aditiva.
+2. Schema Flat: O Excel não suporta listas aninhadas de forma nativa para BI. Tudo deve ser convertido para string.
+3. Segurança de Arquivo: O Excel pode estar aberto pelo usuário. O código deve tratar o bloqueio de arquivo.
+
+--------------------------------------------------------------------------------
+🏗️ Plano de Implementação (Artifacts)
+Os Agentes devem seguir estritamente as instruções abaixo para modificar e criar os arquivos necessários.
+🔹 Agente A: Modelagem de Dados (src/models.py)
+Objetivo: Adicionar o schema de BI sem alterar as classes PerfilCandidato, AnaliseGap ou CVOtimizado já existentes.
+1. Edite src/models.py.
+2. Mantenha as importações e classes existentes.
+3. Adicione a nova classe AnaliseCurriculoBI herdando de BaseModel.
+4. Regra de Negócio (Validators): Se a IA retornar uma lista para principais_skills ou gaps_identificados, utilize um field_validator (modo before) para converter em string separada por vírgulas, garantindo a estrutura flat.
+# Spec para AnaliseCurriculoBI
+class AnaliseCurriculoBI(BaseModel):
+    nome_candidato: str
+    cargo_alvo: str
+    score_aderencia: int  # 0 a 100
+    nivel_senioridade: str  # Junior, Pleno, Senior, Especialista
+    principais_skills: str  # FLAT: "Python, SQL, AWS"
+    gaps_identificados: str  # FLAT: "Inglês, Certificação Cloud"
+    parecer_resumido: str  # Max 2 frases
+🔹 Agente B: Serviço de Persistência (src/services/db_handler.py)
+Objetivo: Criar o manipulador de Excel robusto.
+1. Crie o arquivo src/services/db_handler.py.
+2. Importe pandas as pd, os e openpyxl.
+3. Implemente a função salvar_candidato_excel.
+4. Lógica Incremental:
+    ◦ Verifique os.path.exists(caminho_arquivo).
+    ◦ Se existir: df_antigo = pd.read_excel(..., engine='openpyxl').
+    ◦ Concatene: df_final = pd.concat([df_antigo, df_novo], ignore_index=True).
+    ◦ Se não existir: df_final = df_novo.
+5. Tratamento de Erro: Envolva a operação de escrita (to_excel) em um try/except PermissionError.
+6. Retorno: (bool, str) -> (True, "Sucesso") ou (False, "Erro: Arquivo aberto").
+🔹 Agente C: Integração e Lógica de Negócio (src/services/ai_engine.py & dashboard.py)
+Objetivo: Conectar a inteligência existente ao novo formatador e salvar após a análise.
+Tarefa C.1: Atualizar src/services/ai_engine.py
+1. Importe AnaliseCurriculoBI de src.models.
+2. Não substitua o método _executar_gap_analysis, pois o Dashboard usa o retorno dele (AnaliseGap).
+3. Crie um método adaptador converter_para_bi(self, dados_gap: dict, nome: str, cargo: str) -> dict.
+    ◦ Este método deve mapear os dados do AnaliseGap para o formato AnaliseCurriculoBI.
+    ◦ Mapping:
+        ▪ score_aderencia <- dados_gap['match_percentual']
+        ▪ gaps_identificados <- ", ".join(dados_gap['gaps_tecnicos'])
+        ▪ parecer_resumido <- dados_gap['analise_comparativa'][:200]
+        ▪ nivel_senioridade <- Inferir baseada no score ou passar como "Não Identificado" se não houver no input.
+4. Alternativamente, se for necessária uma nova chamada à LLM para gerar campos específicos (como nivel_senioridade que não existe no AnaliseGap), crie gerar_analise_bi(contexto, vaga) usando o JsonOutputParser(pydantic_object=AnaliseCurriculoBI). Recomendação: Para economizar tokens, tente mapear primeiro.
+Tarefa C.2: Atualizar dashboard.py (UI)
+1. Importe salvar_candidato_excel de src.services.db_handler.
+2. Localize a aba tab1 onde ocorre a chamada res = engine.analisar_documentos(splits, vaga).
+3. Logo após a exibição dos resultados (exibir_card_gap ou exibir_card_perfil):
+    ◦ Prepare o dicionário de dados para o BI (extraindo o nome do candidato do PDF ou usando "Candidato").
+    ◦ Chame salvar_candidato_excel.
+    ◦ Exiba o feedback visual:
+
+--------------------------------------------------------------------------------
+⚠️ Checklist de Qualidade (DoD)
+• [ ] src/models.py compila sem erros de redefinição.
+• [ ] O arquivo Excel é criado na primeira execução e anexado nas seguintes.
+• [ ] Listas (skills/gaps) aparecem como uma única célula de texto no Excel (sem ['item']).
+• [ ] Se o Excel estiver aberto pelo usuário, o Streamlit não trava (exibe erro amigável).
+• [ ] Nenhuma funcionalidade visual anterior (gráficos de match, cards) foi removida.
+
+==================================================
+FILE: docs\prompts\task_02_api_fastapi.md
+==================================================
+
+SYSTEM PROMPT: Arquitetura de API REST (FastAPI)
+Role: Lead Software Architect Contexto: O CV Engine Pro opera atualmente como um monólito acoplado à interface visual (dashboard.py). Para permitir integrações externas (Web/Mobile), precisamos expor a lógica de negócios (AIEngine, pdf_handler, db_handler) através de uma API RESTful robusta.
+Objetivo: Implementar src/api.py utilizando FastAPI, reutilizando os serviços existentes e garantindo que o sistema atual (Streamlit) continue funcionando.
+
+--------------------------------------------------------------------------------
+🏗️ Plano de Implementação (Artifacts)
+Os Agentes devem seguir estritamente as instruções abaixo para modificar e criar os arquivos necessários.
+🔹 Agente A: Infraestrutura da API (src/api.py)
+Objetivo: Configurar o servidor e as regras de segurança (CORS).
+1. Crie o arquivo src/api.py.
+2. Importe FastAPI e CORSMiddleware.
+3. Instancie o app com metadados: title="CV Engine Pro API", version="1.0".
+4. Configuração de CORS:
+    ◦ Adicione o middleware CORSMiddleware.
+    ◦ Defina allow_origins=["*"] (Crítico para permitir requisições de front-ends externos).
+    ◦ Defina allow_credentials=True, allow_methods=["*"], allow_headers=["*"].
+🔹 Agente B: Roteamento e Orquestração (src/api.py)
+Objetivo: Criar o endpoint principal que conecta o Upload -> OCR -> AI -> Banco de Dados.
+1. Importações:
+    ◦ UploadFile, File, Form, HTTPException do fastapi.
+    ◦ Serviços do projeto: src.services.ai_engine (Classe AIEngine), src.services.pdf_handler (processar_pdf) e src.services.db_handler (salvar_candidato_excel).
+2. Criação da Rota:
+    ◦ Verbo/Caminho: POST /api/v1/analisar-cv/.
+    ◦ Parâmetros: arquivo: UploadFile, vaga: str = Form(None).
+3. Lógica de Execução (Fluxo):
+    ◦ Passo 1 (Adaptação de Arquivo): O serviço processar_pdf existente espera um objeto que tenha o método .read(). O UploadFile do FastAPI possui o atributo .file que atende a isso. Passe arquivo.file para o processar_pdf.
+        ▪ Check de Segurança: Se processar_pdf retornar None ou lista vazia, levante HTTPException(400, "Erro ao processar PDF").
+    ◦ Passo 2 (IA):
+        ▪ Instancie engine = AIEngine().
+        ▪ Chame resultado = engine.analisar_documentos(splits, vaga).
+    ◦ Passo 3 (Persistência BI):
+        ▪ Verifique if vaga:.
+        ▪ Extraia o nome do candidato do resultado (resultado.get("nome")) ou use o nome do arquivo (arquivo.filename).
+        ▪ Utilize o método engine.converter_para_bi(resultado, nome, vaga).
+        ▪ Chame salvar_candidato_excel(dados_bi).
+    ◦ Passo 4 (Retorno): Retorne o dicionário resultado como JSON.
+4. Tratamento de Erros: Envolva todo o bloco lógico em um try/except. Retorne código 500 para erros genéricos.
+🔹 Agente C: Gerenciamento de Dependências (requirements.txt)
+Objetivo: Garantir que o ambiente suporte o servidor web e a manipulação de dados.
+1. Edite o arquivo requirements.txt.
+2. Adicione as seguintes bibliotecas essenciais para a nova arquitetura:
+3. (Nota: pandas e openpyxl já são usados no db_handler, mas precisam estar explícitos no requirements para o deploy da API).
+
+--------------------------------------------------------------------------------
+📝 Exemplo de Estrutura de Código (src/api.py)
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from src.services.ai_engine import AIEngine
+from src.services.pdf_handler import processar_pdf
+from src.services.db_handler import salvar_candidato_excel
+
+app = FastAPI(title="CV Engine Pro API", version="1.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@app.post("/api/v1/analisar-cv/")
+def analisar_cv(arquivo: UploadFile = File(...), vaga: str = Form(None)):
+    try:
+        # 1. Processamento do PDF
+        # O pdf_handler [1] lê o arquivo, cria um temp e faz o split
+        splits = processar_pdf(arquivo.file)
+        
+        if not splits:
+            raise HTTPException(status_code=400, detail="Não foi possível ler o PDF ou ele está vazio.")
+
+        # 2. Motor de IA
+        engine = AIEngine()
+        resultado = engine.analisar_documentos(splits, vaga)
+
+        # 3. Persistência (Regra de Negócio: Só salva no BI se houver Vaga para comparar)
+        if vaga:
+            try:
+                # Recupera nome do JSON ou usa o nome do arquivo
+                nome_candidato = resultado.get("nome", arquivo.filename.replace(".pdf", "").replace("_", " ").title())
+                
+                # Usa o conversor existente na classe AIEngine [3]
+                dados_bi = engine.converter_para_bi(resultado, nome_candidato, vaga)
+                
+                salvar_candidato_excel(dados_bi)
+            except Exception as e:
+                # Log de erro silencioso para não falhar a request principal
+                print(f"Erro ao salvar BI: {e}")
+
+        return resultado
+
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erro interno do servidor: {str(e)}")
+⚠️ Checklist de Validação (DoD)
+• [ ] O comando uvicorn src.api:app --reload inicia a API sem erros.
+• [ ] A rota aceita upload via Swagger UI (/docs).
+• [ ] O arquivo Excel é atualizado automaticamente quando uma vaga é enviada.
+• [ ] requirements.txt contém python-multipart (necessário para UploadFile).
+• [ ] Nenhuma alteração foi feita dentro de src/services/ai_engine.py ou src/services/pdf_handler.py que pudesse quebrar o Streamlit.
+
+==================================================
+FILE: docs\prompts\task_03_score_deterministico.md
+==================================================
+
+# 🏷️ Cálculo de Score Determinístico (Python-Side)
+**Versão:** 1.0.0 | **Status:** Validated
+
+## 🎯 Missão
+Desacoplar o cálculo aritmético do LLM. A IA deve apenas auditar e pontuar categorias individuais, enquanto o Python realiza a soma final do `match_percentual`.
+
+## 🚧 Regras de Pontuação (Rubrica Fixa)
+1. **Técnico (0-50 pts):** Hard skills e ferramentas.
+2. **Senioridade (0-30 pts):** Fit de cargo e tempo de XP.
+3. **Diferenciais (0-20 pts):** Formação e extras.
+
+## ✅ Critérios de Aceite
+- [ ] Modelos Pydantic atualizados com campos de score parciais.
+- [ ] Prompt da IA focado em atribuição de notas por categoria.
+- [ ] Soma realizada via Python antes da persistência no BI.
+
+==================================================
+FILE: docs\prompts\task_04_frontend_react.md
+==================================================
+
+🎨 Design System & UI Specification (Dark Tech)
+1. Paleta de Cores (Tailwind CSS)
+O visual é "Dark Mode Nativo", transmitindo alta tecnologia e foco.
+• Background Principal (Canvas): bg-slate-950 (Um preto azulado profundo, não preto absoluto #000).
+• Superfícies (Cards): bg-slate-900 com bordas sutis border border-slate-800.
+• Ação Primária (CTA): bg-lime-400 (O verde neon da Imagem e).
+    ◦ Estado Hover: hover:bg-lime-300.
+    ◦ Texto do Botão: text-slate-950 font-bold (Contraste máximo).
+• Ação Secundária / Destaques: text-blue-600 ou bg-blue-600 (O azul elétrico das barras de progresso na Imagem).
+• Semântica de Feedback (API):
+    ◦ Score Alto / Pontos Fortes: text-emerald-400 (Variação do Lime para texto).
+    ◦ Gaps / Alertas: text-rose-500 (Vermelho suave para manter legibilidade no escuro).
+• Tipografia:
+    ◦ H1/H2: text-slate-50 (Branco gelo).
+    ◦ Parágrafos: text-slate-400 (Cinza médio para reduzir fadiga visual).
+2. Tipografia e Formas
+Baseado na suavidade dos elementos das imagens e.
+• Arredondamento (Border Radius):
+    ◦ Cards Grandes: rounded-2xl ou rounded-3xl (Bem arredondado, estilo "App Mobile").
+    ◦ Botões: rounded-full (Pill shape, conforme botão "Generate workout plan" na Imagem).
+    ◦ Inputs/Tags: rounded-lg.
+• Sombras e Profundidade:
+    ◦ Cards: shadow-xl com uma leve cor colorida difusa: shadow-slate-900/50.
+    ◦ Glow Effect (Opcional): Elementos de destaque podem ter um ring-2 ring-lime-400/20.
+• Fonte: Inter ou Outfit (Google Fonts). Sans-serif geométrica.
+
+--------------------------------------------------------------------------------
+3. Mapeamento de Componentes vs. API
+Aqui conectamos o JSON retornado pela rota POST /api/v1/analisar-cv/ aos elementos visuais das imagens.
+A. Área de Upload (Hero Section)
+• Referência Visual: Imagem (Card "Ready for Your Transformation?").
+• Comportamento:
+    ◦ Substituir o texto "Ready for Your Transformation?" por "Pronto para sua nova vaga?".
+    ◦ Substituir a imagem do halterofilista por uma ilustração 3D abstrata de documentos ou foguete.
+    ◦ Botão Lime Green: "Analisar meu CV Agora". Ao clicar, abre o explorador de arquivos (Input file hidden).
+    ◦ Input de Vaga: Um textarea com fundo escuro (bg-slate-950) integrado ao card antes do botão.
+B. O Score Geral (match_percentual)
+• Referência Visual: Imagem (Os círculos com números "01", "02", "03").
+• Implementação:
+    ◦ Transformar o círculo pequeno em um Radial Progress Grande.
+    ◦ Cor do anel: stroke-lime-400.
+    ◦ Centro: O valor numérico grande (ex: "85%").
+    ◦ Legenda: "Aderência à Vaga".
+C. Métricas Detalhadas (Barras de Progresso)
+• Referência Visual: Imagem (Cards "Body Building", "Calorie Burning").
+• Dados da API: score_tecnico (0-50), score_senioridade (0-30), score_diferencial (0-20).
+• Implementação:
+    ◦ Usar o estilo exato das barras azuis da Imagem.
+    ◦ Label "Strength" -> Vira "Hard Skills" (score_tecnico).
+    ◦ Label "Cardio" -> Vira "Senioridade" (score_senioridade).
+    ◦ Barra preenchida com bg-blue-600 sobre trilho bg-slate-800.
+D. Gaps e Pontos Fortes (Cards Bento Grid)
+• Referência Visual: Imagem (O grid irregular "More than just a workout").
+• Dados da API: pontos_fortes (Lista) e gaps_tecnicos (Lista).
+• Implementação:
+    ◦ Card Esquerdo (Grande): "Análise Comparativa" (Texto corrido da analise_comparativa).
+    ◦ Card Direito Superior (Azul/Escuro): "Pontos Fortes". Listar os itens com ícones de Check Verde (text-lime-400).
+    ◦ Card Direito Inferior (Lime/Vibrante): "Gaps Identificados".
+        ▪ Inversão de cor: Fundo bg-lime-400, Texto text-slate-900.
+        ▪ Listar os gaps como itens de atenção.
+
+--------------------------------------------------------------------------------
+4. Estrutura do Layout (Wireframe Textual)
+[ Container Principal (max-w-6xl mx-auto px-4 py-8 bg-slate-950) ]
+|
++-- [ Header: Logo "CV Engine" (Branco) + Menu ]
+|
++-- [ Hero Section (Referência Imagem 4) ]
+|   |-- Título: "Aumente suas chances de entrevista"
+|   |-- Form: [ Upload PDF ] + [ Textarea Vaga ]
+|   |-- Botão CTA (Lime): "Gerar Análise"
+|
++-- [ Loading State ] (Skeleton dark mode pulsante)
+|
++-- [ Results Grid (Aparece após API 200 OK) ]
+    |
+    +-- [ Linha 1: KPIs Principais ]
+    |   |-- Coluna Esq: Gauge Chart (Match %)
+    |   |-- Coluna Dir: 3 Barras de Progresso (Skills, Senioridade, Diferencial)
+    |       (Referência Imagem 2)
+    |
+    +-- [ Linha 2: Insights Detalhados (Referência Imagem 3 - Bento Grid) ]
+    |   |-- Card Grande (2 colunas): Parecer da IA (Texto)
+    |   |-- Coluna Lateral:
+    |       |-- Card Topo: Lista Pontos Fortes (Ícones Verdes)
+    |       |-- Card Base: Lista Gaps (Estilo Alerta)
+    |
+    +-- [ Linha 3: Call to Action Final ]
+        |-- Botão Outline: "Baixar Relatório PDF"
+        |-- Botão Primary: "Reescrever CV com IA" (Chama endpoint /otimizar)
+Observação para o Dev React: Lembre-se de configurar o tailwind.config.js para estender as cores:
+theme: {
+  extend: {
+    colors: {
+      brand: {
+        dark: '#0f172a', // Slate-900 base
+        neon: '#a3e635', // Lime-400
+        accent: '#2563eb', // Blue-600
+      }
+    }
+  }
+}
+
+==================================================
+FILE: docs\prompts\task_05_pixel_perfect_ui.md
+==================================================
+
+# 🏷️ Refinamento Visual (Pixel Perfect) - Next.js + Tailwind
+
+---
+
+## 🎭 1. Papel e Persona (Role)
+Você atua como um UI/UX Engineer focado em "Pixel Perfect" UI. Sua especialidade é traduzir mockups e imagens de referência para classes utilitárias do Tailwind CSS com precisão milimétrica.
+
+## 🏢 2. Contexto do Negócio (Context)
+A estrutura base do nosso front-end (`src/app/page.tsx`) e a integração com a API já estão prontas e funcionais. No entanto, o visual precisa de um polimento final para ficar idêntico às referências visuais de alta fidelidade que o time de design aprovou.
+
+## 🎯 3. Objetivo Principal (Mission)
+Analisar as imagens contidas no diretório `docs/design_references/` e alterar as classes do Tailwind CSS no arquivo `page.tsx` para garantir que o resultado no navegador seja uma cópia fiel do design proposto, sem quebrar a lógica de integração e os estados do React (`loading`, `result`).
+
+## 🚧 4. Regras e Restrições (Constraints)
+1. **Preservação de Lógica:** NÃO altere absolutamente nada dentro da função `handleUpload`, dos `useStates` ou do *fetch* da API. Seu escopo é 100% visual (HTML/Tailwind).
+2. **Fidelidade Visual:** - Ajuste sombras (ex: `shadow-xl`, cores de *drop-shadow*).
+   - Corrija espaçamentos internos e externos (`padding` e `margin`).
+   - Ajuste o tamanho das fontes e os pesos (`font-medium`, `font-bold`, `tracking-tight`).
+   - Replique bordas arredondadas e *glow effects* (brilhos neon) que existam na imagem.
+3. **Responsividade:** Mantenha as diretivas de responsividade do Tailwind (ex: `md:grid-cols-2`, `flex-col md:flex-row`). O design deve continuar quebrando graciosamente em telas de celular.
+
+## ✅ 5. Critérios de Aceite (DoD)
+- [ ] A interface web gerada reflete os mesmos espaçamentos e contrastes da imagem de referência.
+- [ ] O componente circular de aderência (Gauge) e as barras de progresso horizontais mantêm o estilo aprovado.
+- [ ] Nenhuma função assíncrona ou regra de negócio em TypeScript foi removida ou alterada.
+
+==================================================
+FILE: docs\prompts\task_06_refatoracao_front.md
+==================================================
+
+SYSTEM PROMPT: Refatoração de Interface (Pivotagem B2B)
+Role: Lead Frontend Engineer (React/Next.js Specialist) Contexto: O produto "CV Engine Pro" está pivotando de B2C para B2B. A interface deve deixar de falar com o "Candidato" e passar a falar com o "Recrutador/RH". O foco é volume, triagem e ranqueamento.
+Objetivos:
+1. Atualizar o Copywriting da HeroSection.jsx para um tom corporativo/SaaS.
+2. Habilitar o upload de múltiplos arquivos (Batch Processing).
+3. Alterar a representação visual (Mockup) para ilustrar um ranking de candidatos em vez de um score individual.
+
+--------------------------------------------------------------------------------
+🏗️ Plano de Implementação (Artifacts)
+O Agente deve modificar os seguintes componentes seguindo rigorosamente as instruções abaixo.
+🔹 Componente 1: src/components/HeroSection.jsx
+1. Copywriting & Tone of Voice: Substitua os textos hardcoded atuais pelos novos textos B2B:
+• Badge: De AI Powered Analysis v3.0 → Para Enterprise AI Screening v3.0.
+• H1: De Pronto para sua nova vaga? → Para Triagem Inteligente de Talentos.
+• Subtítulo: De Otimize seu currículo... → Para Faça o upload de lotes de currículos, defina os requisitos e receba o ranking dos melhores candidatos em segundos.
+• Input Vaga (Placeholder): De Cole a descrição da vaga aqui... → Para Cole a Job Description completa (Requisitos Técnicos, Senioridade e Stack)...
+• Botão CTA: De Analisar Agora → Para Processar Lote.
+2. Funcionalidade de Upload (Batch):
+• No elemento <input type="file" ... />, adicione o atributo multiple.
+• Altere a lógica de exibição do arquivo selecionado:
+    ◦ Antes: Mostrava o nome de 1 arquivo.
+    ◦ Agora: Deve mostrar um contador: 📄 {files.length} currículos selecionados.
+• Adicione uma validação visual simples: Se files.length > 0, o botão de upload fica com borda border-brand-neon e fundo bg-brand-neon/10.
+3. Ilustração Lateral (Mockup "Ranked List"): Substitua o card atual (que mostra um único gráfico de barra e score 92%) por uma representação de Lista de Ranking.
+• Container: Mantenha o estilo bg-slate-900 border border-slate-700.
+• Conteúdo Novo: Crie 3 linhas simulando candidatos:
+    ◦ Linha 1 (Topo): Avatar, "Ana Silva", Badge "98% Match" (Verde/Neon).
+    ◦ Linha 2: Avatar, "João Souza", Badge "85% Match" (Azul).
+    ◦ Linha 3: Avatar, "Carlos M.", Badge "71% Match" (Cinza).
+• Detalhe: Adicione um ícone de "Coroa" ou "Troféu" (Lucide React) na primeira linha.
+🔹 Componente 2: src/App.jsx (Gerenciamento de Estado)
+1. State Lift: Atualize o estado para suportar arrays.
+• De: const [file, setFile] = useState(null);
+• Para: const [files, setFiles] = useState([]);
+2. Integração (Handler): Atualize a função que recebe o evento do HeroSection:
+// Atualize o prop passado para o HeroSection
+const handleFileSelect = (e) => {
+  if (e.target.files && e.target.files.length > 0) {
+    // Converte FileList para Array
+    setFiles(Array.from(e.target.files));
+  }
+};
+3. Loop de Requisição (Mock de Lote): Nota: Como a API atual (/analisar-cv/) aceita apenas 1 arquivo por vez, o front-end deve iterar temporariamente ou preparar o terreno para a V2 da API.
+• Altere o handleAnalyze para iterar sobre files e fazer múltiplas requisições (ou exiba um console.log("Batch processing initiated") e processe apenas o primeiro arquivo visualmente por enquanto, mas deixe a estrutura de array pronta).
+
+--------------------------------------------------------------------------------
+🎨 Especificação Visual (Tailwind CSS)
+Mantenha a coerência com o arquivo frontend/tailwind.config.js e o tema "Corporate Blue".
+• Fundo da Hero: bg-slate-950.
+• Cards/Inputs: bg-slate-800 com borda border-slate-700.
+• Botão Principal (CTA):
+    ◦ Cor: bg-brand-neon (#a3e635).
+    ◦ Texto: text-slate-900 e font-bold.
+    ◦ Hover: hover:bg-lime-300 e hover:shadow-[0_0_20px_rgba(163,230,53,0.4)].
+• Texto de Destaque: Use text-brand-neon para números importantes e badges.
+
+--------------------------------------------------------------------------------
+📝 Exemplo de Código Esperado (HeroSection.jsx - Trecho)
+{/* Lado Direito: Nova Ilustração de Ranking */}
+<div className="hidden md:flex flex-1 justify-center items-center relative">
+  <div className="relative w-72 bg-slate-900 rounded-2xl border border-slate-700 shadow-2xl p-6 transform rotate-[-3deg]">
+    {/* Header do Mockup */}
+    <div className="flex justify-between items-center mb-6 border-b border-slate-800 pb-4">
+      <span className="text-slate-400 text-xs uppercase tracking-wider">Top Candidates</span>
+      <span className="text-brand-neon text-xs font-bold">AI Ranking</span>
+    </div>
+    
+    {/* Lista de Candidatos */}
+    <div className="space-y-4">
+      {/* Candidato 1 */}
+      <div className="flex items-center gap-3 p-2 bg-slate-800/50 rounded-lg border border-brand-neon/30">
+        <div className="w-8 h-8 rounded-full bg-brand-neon/20 flex items-center justify-center text-brand-neon text-xs font-bold">AS</div>
+        <div className="flex-1">
+          <div className="h-2 w-20 bg-slate-600 rounded mb-1"></div>
+          <div className="h-1.5 w-12 bg-slate-700 rounded"></div>
+        </div>
+        <span className="text-brand-neon font-bold text-sm">98%</span>
+      </div>
+      
+      {/* Candidato 2 */}
+      <div className="flex items-center gap-3 p-2">
+        <div className="w-8 h-8 rounded-full bg-slate-700 flex items-center justify-center text-slate-400 text-xs">JS</div>
+        <div className="flex-1">
+          <div className="h-2 w-16 bg-slate-700 rounded mb-1"></div>
+          <div className="h-1.5 w-10 bg-slate-800 rounded"></div>
+        </div>
+        <span className="text-blue-500 font-bold text-sm">85%</span>
+      </div>
+    </div>
+  </div>
+</div>
+⚠️ Checklist de Validação (DoD)
+• [ ] O usuário consegue selecionar múltiplos PDFs na janela de arquivos.
+• [ ] O texto do botão muda para "Processar Lote".
+• [ ] A ilustração lateral reflete uma lista de candidatos e não mais um score único.
+• [ ] Nenhuma cor fora da paleta slate-950/900/800 e lime-400 foi introduzida.
+
+==================================================
+FILE: docs\prompts\task_07_login_senha.md
+==================================================
+
+SYSTEM PROMPT: Back-end API (FastAPI) - Auth & Data Pipelines
+Role: Senior Backend Engineer (Python/FastAPI) Contexto: O CV Engine Pro está evoluindo de um script local para um SaaS B2B. Precisamos proteger a API (atualmente aberta) e fornecer endpoints para que o Dashboard React possa não apenas enviar dados, mas também consumir o histórico acumulado. Arquitetura de Dados: Devido à fase de MVP, utilizamos arquivos Excel (.xlsx) como banco de dados relacional e documental provisório.
+
+--------------------------------------------------------------------------------
+🏗️ Plano de Implementação (Artifacts)
+Os Agentes devem seguir estritamente as instruções abaixo.
+🔹 Agente A: Serviço de Autenticação (src/services/auth_handler.py)
+Objetivo: Gerenciar usuários usando usuarios.xlsx como persistência e implementar lógica JWT.
+1. Dependências: Utilize passlib[bcrypt], python-jose (ou pyjwt) e pandas.
+2. Gerenciamento de DB (usuarios.xlsx):
+    ◦ Crie função carregar_usuarios(): Lê o Excel. Se não existir, cria um DataFrame vazio com colunas: ['id_usuario', 'email', 'senha_hash', 'nome_empresa', 'data_criacao'].
+    ◦ Crie função criar_usuario(email, senha_raw, empresa):
+        ▪ Gera id_usuario (uuid4).
+        ▪ Faz hash da senha.
+        ▪ Append no DataFrame e salva com lock (try/except PermissionError).
+    ◦ Crie função buscar_usuario_por_email(email): Retorna dict ou None.
+3. Segurança:
+    ◦ Implemente verify_password e get_password_hash.
+    ◦ Implemente create_access_token(data: dict).
+🔹 Agente B: Modelagem de Dados (src/schemas.py)
+Objetivo: Centralizar os esquemas Pydantic para validação rigorosa de I/O.
+1. Crie/Edite src/schemas.py.
+2. Defina os modelos de Autenticação: UserLogin, UserCreate, Token.
+3. Implemente o Modelo Obrigatório de IA: Copie estritamente a classe abaixo para validar a saída antes da persistência:
+from pydantic import BaseModel
+from datetime import datetime
+
+class ResultadoIA(BaseModel):
+    nome_candidato: str
+    cargo_alvo: str
+    score_aderencia: int
+    nivel_senioridade: str
+    principais_skills: str
+    gaps_identificados: str
+    parecer_resumido: str
+    data_analise: datetime
+🔹 Agente C: Atualização da API e Rotas (src/api.py)
+Objetivo: Proteger rotas existentes e criar rotas de consumo de dados.
+1. Configuração de Segurança:
+    ◦ Instancie oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/v1/auth/login").
+    ◦ Crie a dependência get_current_user que decodifica o JWT e valida se o usuário existe em usuarios.xlsx.
+2. Novas Rotas de Auth:
+    ◦ POST /api/v1/auth/signup: Recebe JSON, cria usuário em usuarios.xlsx.
+    ◦ POST /api/v1/auth/login: Recebe OAuth2PasswordRequestForm, valida credenciais e retorna JWT.
+3. Refatoração da Rota de Análise (POST /api/v1/analisar-cv/):
+    ◦ Adicione a dependência: user: dict = Depends(get_current_user).
+    ◦ Pipeline de Persistência:
+        ▪ Após receber o resultado da IA (que hoje é um dict solto ou AnaliseCurriculoBI), mapeie para o novo schema ResultadoIA.
+        ▪ Adicione data_analise=datetime.now().
+        ▪ Chame a função de salvar no Excel (atualize db_handler se necessário para aceitar o objeto Pydantic ou converta para dict com .model_dump()).
+4. Nova Rota de Consumo (GET /api/v1/dashboard/metrics):
+    ◦ Protegida por Depends(get_current_user).
+    ◦ Lógica: Lê dados_bi.xlsx via Pandas.
+    ◦ Processamento:
+        ▪ Calcula KPI: Total de CVs processados.
+        ▪ Calcula KPI: Média de Score de Aderência.
+        ▪ Retorna os últimos 10 registros (JSON) para popular a tabela do Dashboard.
+🔹 Agente D: Dependências (requirements.txt)
+Adicione explicitamente:
+python-jose
+passlib
+bcrypt
+python-multipart
+pandas
+openpyxl
+
+--------------------------------------------------------------------------------
+📝 Exemplo de Fluxo de Dados (Persistência com Validação)
+# Trecho para src/api.py
+
+from src.schemas import ResultadoIA
+from datetime import datetime
+
+# ... dentro da rota analisar_cv ...
+
+# 1. IA Processa
+resultado_dict = engine.analisar_documentos(splits, vaga)
+
+# 2. Adaptação para Schema Rigoroso
+dados_validados = ResultadoIA(
+    nome_candidato=resultado_dict.get("nome", "Desconhecido"),
+    cargo_alvo=vaga[:50] if vaga else "Geral",
+    score_aderencia=int(resultado_dict.get("match_percentual", 0)),
+    nivel_senioridade=resultado_dict.get("senioridade_inferida", "N/A"),
+    principais_skills=", ".join(resultado_dict.get("pontos_fortes", [])),
+    gaps_identificados=", ".join(resultado_dict.get("gaps_tecnicos", [])),
+    parecer_resumido=resultado_dict.get("analise_comparativa", "")[:200],
+    data_analise=datetime.now()
+)
+
+# 3. Salva usando o handler (convertendo para dict se o handler usar pandas direto)
+salvar_candidato_excel(dados_validados.model_dump())
+⚠️ Checklist de Validação (DoD)
+• [ ] O arquivo usuarios.xlsx é criado automaticamente se não existir.
+• [ ] A rota /analisar-cv/ rejeita requisições sem Header Authorization: Bearer <token>.
+• [ ] O endpoint /metrics retorna dados lidos de dados_bi.xlsx.
+• [ ] A coluna data_analise é gravada corretamente no Excel com data/hora.
+• [ ] Senhas são armazenadas como Hash (nunca texto plano).
+
+==================================================
+FILE: docs\prompts\task_08_dashboard.md
+==================================================
+
+🎯 SYSTEM PROMPT: Dashboard Analítico (Réplica Visual "Dark Tech")
+Role: Senior Frontend Engineer (React/Recharts Specialist) Referência Visual: "Captura de tela 2026-02-17 134112.png" (Layout de Painel Executivo). Objetivo: Construir a página /analytics consumindo a API do CV Engine Pro. O layout deve ser Pixel Perfect em relação à referência: Fundo escuro profundo, cards destacados, gráficos azuis e tabelas densas.
+
+--------------------------------------------------------------------------------
+1. Estrutura Visual & Layout (Grid System)
+O layout não é um simples grid uniforme. Ele é dividido em zonas funcionais. Utilize CSS Grid para replicar a estrutura da imagem:
+• Global Container: bg-[#0B1120] (Slate-950 profundo, quase preto).
+• Padding: p-6 ou p-8.
+• Header: Barra superior contendo o Título e os Filtros de Data (Ano/Mês).
+Disposição dos Blocos (Grid Template):
+/* Sugestão de Grid para Telas Grandes (lg/xl) */
+grid-template-columns: 2fr 1fr; /* Coluna da Esquerda (Larga) e Direita (Estreita) */
+gap: 1.5rem;
+📍 Zona A: KPIs (Topo Esquerdo)
+• Referência: 3 Cards Retangulares.
+• Estilo: bg-slate-800 com borda sutil border-slate-700/50.
+• Conteúdo:
+    1. Média Score Aderência: (Ex: 53,3). Texto grande centralizado.
+    2. Qtde. Candidatos: (Ex: 178).
+    3. Taxa de Aprovação: (Ex: 22,5% - Calcular % de candidatos com score >= 70).
+📍 Zona B: Gráficos Temporais (Coluna Esquerda - Abaixo dos KPIs)
+• Referência: Dois gráficos largos empilhados verticalmente.
+• Estilo dos Gráficos:
+    ◦ Fundo dos containers: Transparente ou bg-slate-800 (conforme imagem).
+    ◦ Gráfico 1 (Linha): "Média Score por Mês".
+        ▪ Linha: Azul (#3b82f6).
+        ▪ Área: Preenchimento gradiente abaixo da linha (azul transparente).
+        ▪ Pontos: Círculos brancos ou azuis preenchidos.
+    ◦ Gráfico 2 (Barras): "Total Candidatos por Mês".
+        ▪ Barras: Azul sólido (#1d4ed8 ou #2563eb).
+        ▪ Labels: Números brancos flutuando acima das barras (Ex: "16", "21").
+📍 Zona C: Tabelas de Quebra (Coluna Direita - Full Height)
+• Referência: Uma pilha vertical de 3 tabelas compactas.
+• Estilo das Tabelas:
+    ◦ Header: bg-slate-900 ou transparente com borda inferior azul (border-b-2 border-blue-600).
+    ◦ Linhas: Zebra striping muito sutil (odd:bg-slate-800 even:bg-slate-800/50).
+    ◦ Tabela 1: "Cargo Alvo" (Colunas: Cargo, Média Score, Total).
+    ◦ Tabela 2: "Nível Senioridade" (Colunas: Nível, Média Score, Total).
+    ◦ Tabela 3 (Lista): "Nome Candidato" (A lista detalhada com Scroll).
+        ▪ Destaque: Coluna "Classificação" deve ter a estrela dourada ⭐ e texto amarelo para "Elite".
+
+--------------------------------------------------------------------------------
+2. Lógica de Dados (Front-end Processing)
+A API atual (/api/v1/dashboard/metrics) retorna recent_activity (limitado a 10) e KPIs simples. Para replicar os gráficos da imagem (que mostram o ano todo), você precisará alterar a estratégia:
+Ação Necessária (Backend): O Backend Agent deve alterar o endpoint GET /dashboard/metrics para retornar todos os registros (ou uma agregação completa) em vez de apenas os 10 últimos.
+• Novo Payload JSON Esperado: {"all_records": [...lista completa...]}.
+Processamento (React): Use useMemo para calcular as agregações no cliente (Client-Side Aggregation) para garantir interatividade rápida com os filtros:
+1. Agrupamento por Mês:
+    ◦ Itere sobre all_records.
+    ◦ Extraia o mês de data_analise.
+    ◦ Calcule count e avg(score_aderencia).
+2. Agrupamento por Cargo/Senioridade:
+    ◦ reduce da lista filtrada pelas chaves cargo_alvo e nivel_senioridade.
+3. Filtros:
+    ◦ Implemente os sliders de "Ano" e "Mês" (Range Slider) vistos no topo direito da imagem. O estado desses filtros deve recalcular todos os gráficos.
+
+--------------------------------------------------------------------------------
+3. Especificação de Componentes (Recharts & Tailwind)
+🎨 Paleta de Cores (Corporate Blue)
+• Fundo: bg-[#0f1419] ou bg-slate-950.
+• Card Background: bg-[#1e293b] (Slate-800).
+• Texto Principal: text-white (ou slate-50).
+• Texto Secundário: text-slate-400.
+• Cor do Gráfico (Primary): #3b82f6 (Blue-500).
+• Destaque Elite: #fbbf24 (Amber-400) ou #eab308 (Yellow-500).
+📊 Configuração Recharts
+• XAxis/YAxis: tick={{ fill: '#94a3b8', fontSize: 12 }}. Remova as linhas de grade verticais (vertical={false}).
+• Tooltip: Customizado com fundo escuro (contentStyle={{ backgroundColor: '#1e293b', border: '1px solid #334155' }}).
+🏆 Tabela de Classificação (Regra Visual)
+Baseado na coluna "Classificação" da imagem:
+const renderClassificacao = (score) => {
+  if (score >= 90) return <span className="text-yellow-400 font-bold flex items-center gap-1">⭐ Elite</span>;
+  if (score >= 70) return <span className="text-blue-400 font-medium">✅ Qualificado</span>;
+  return <span className="text-slate-500">Em Desenvolvimento</span>;
+};
+
+--------------------------------------------------------------------------------
+4. Código do Componente (AnalyticsDashboard.jsx)
+Aqui está o esqueleto para implementar exatamente a visão da captura de tela:
+import React, { useMemo, useState, useEffect } from 'react';
+import { LineChart, Line, BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Area, AreaChart } from 'recharts';
+import { Filter } from 'lucide-react';
+import axios from 'axios';
+
+export default function AnalyticsDashboard() {
+  const [rawData, setRawData] = useState([]);
+  const [year, setYear] = useState(2025);
+  const [monthRange, setMonthRange] = useState([2, 3]);
+
+  // 1. Fetch Full Data
+  useEffect(() => {
+    // Backend deve ser ajustado para retornar 'all_records'
+    axios.get('/api/v1/dashboard/metrics').then(res => setRawData(res.data.all_records || []));
+  }, []);
+
+  // 2. Client-Side Processing
+  const processedData = useMemo(() => {
+    if (!rawData.length) return { monthly: [], byRole: [], bySeniority: [], kpi: {} };
+
+    // Filtra por data (Range Slider logic mock)
+    const filtered = rawData.filter(d => {
+       const date = new Date(d.data_analise);
+       return date.getFullYear() === year && (date.getMonth() + 1 >= monthRange && date.getMonth() + 1 <= monthRange[2]);
+    });
+
+    // KPI Calc
+    const total = filtered.length;
+    const avgScore = total ? (filtered.reduce((acc, cur) => acc + cur.score_aderencia, 0) / total).toFixed(1) : 0;
+    const approved = filtered.filter(d => d.score_aderencia >= 70).length;
+    const approvalRate = total ? ((approved / total) * 100).toFixed(1) : 0;
+
+    // Monthly Grouping (Para os Gráficos)
+    // ... Implementar reduce por mês (1-12) ...
+    
+    return { kpi: { total, avgScore, approvalRate }, filtered };
+  }, [rawData, year, monthRange]);
+
+  return (
+    <div className="min-h-screen bg-[#0B1120] text-white p-6 font-sans">
+      {/* Header & Filters */}
+      <div className="flex justify-between items-center mb-8 bg-slate-800/50 p-4 rounded-xl border border-slate-700">
+        <h1 className="text-2xl font-semibold">AI Resume Reader | <span className="text-slate-400">Todos os Cargos</span></h1>
+        
+        <div className="flex gap-6 items-center">
+             {/* Mock dos Sliders da imagem */}
+             <div className="flex flex-col w-32">
+                <span className="text-xs text-slate-400 mb-1">Ano: {year}</span>
+                <input type="range" min="2024" max="2026" value={year} onChange={e => setYear(Number(e.target.value))} className="accent-blue-500"/>
+             </div>
+             <div className="flex flex-col w-32">
+                <span className="text-xs text-slate-400 mb-1">Mês: {monthRange} - {monthRange[2]}</span>
+                {/* Dual range slider placeholder */}
+                <div className="h-1 bg-blue-600 rounded"></div>
+             </div>
+        </div>
+      </div>
+
+      {/* Main Grid Layout */}
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+        
+        {/* LEFT COLUMN (2/3 width) */}
+        <div className="lg:col-span-2 space-y-6">
+            
+            {/* KPI ROW */}
+            <div className="grid grid-cols-3 gap-4">
+                <KPICard title="Média Score Aderência" value={processedData.kpi.avgScore} />
+                <KPICard title="Qtde. Candidatos" value={processedData.kpi.total} />
+                <KPICard title="Taxa de Aprovação" value={`${processedData.kpi.approvalRate}%`} />
+            </div>
+
+            {/* CHART: Média Score por Mês */}
+            <div className="bg-slate-800 p-5 rounded-xl border border-slate-700">
+                <h3 className="text-sm font-semibold mb-4 text-slate-200">Média Score por Mês</h3>
+                <div className="h-64">
+                    <ResponsiveContainer width="100%" height="100%">
+                        <AreaChart data={processedData.monthly}> {/* Use AreaChart para o preenchimento */}
+                            <defs>
+                                <linearGradient id="colorScore" x1="0" y1="0" x2="0" y2="1">
+                                    <stop offset="5%" stopColor="#3b82f6" stopOpacity={0.3}/>
+                                    <stop offset="95%" stopColor="#3b82f6" stopOpacity={0}/>
+                                </linearGradient>
+                            </defs>
+                            <CartesianGrid vertical={false} stroke="#334155" strokeDasharray="3 3" />
+                            <XAxis dataKey="name" stroke="#94a3b8" />
+                            <YAxis stroke="#94a3b8" />
+                            <Tooltip contentStyle={{backgroundColor: '#1e293b', borderColor: '#334155'}} />
+                            <Area type="monotone" dataKey="score" stroke="#3b82f6" fillOpacity={1} fill="url(#colorScore)" />
+                        </AreaChart>
+                    </ResponsiveContainer>
+                </div>
+            </div>
+
+            {/* CHART: Total Candidatos por Mês */}
+            <div className="bg-slate-800 p-5 rounded-xl border border-slate-700">
+                <h3 className="text-sm font-semibold mb-4 text-slate-200">Total Candidatos por Mês</h3>
+                <div className="h-64">
+                     <ResponsiveContainer width="100%" height="100%">
+                        <BarChart data={processedData.monthly}>
+                            <CartesianGrid vertical={false} stroke="#334155" />
+                            <XAxis dataKey="name" stroke="#94a3b8" />
+                            <YAxis stroke="#94a3b8" />
+                            <Bar dataKey="count" fill="#2563eb" radius={[4]} label={{ position: 'top', fill: 'white', fontSize: 12 }} />
+                        </BarChart>
+                    </ResponsiveContainer>
+                </div>
+            </div>
+        </div>
+
+        {/* RIGHT COLUMN (1/3 width) - Tables */}
+        <div className="space-y-6">
+            <MiniTable title="Cargo Alvo" data={processedData.byRole} cols={['Cargo', 'Média', 'Total']} />
+            <MiniTable title="Nível Senioridade" data={processedData.bySeniority} cols={['Nível', 'Média', 'Total']} />
+            
+            {/* Detailed List */}
+            <div className="bg-slate-800 rounded-xl border border-slate-700 h-[600px] flex flex-col">
+                <div className="p-4 border-b border-slate-700">
+                    <h3 className="font-semibold text-slate-200">Classificação Detalhada</h3>
+                </div>
+                <div className="overflow-auto flex-1 p-2">
+                    <table className="w-full text-xs text-left text-slate-300">
+                        <thead className="text-slate-500 uppercase bg-slate-900/50 sticky top-0">
+                            <tr>
+                                <th className="p-2">Nome</th>
+                                <th className="p-2">Score</th>
+                                <th className="p-2">Classificação</th>
+                            </tr>
+                        </thead>
+                        <tbody className="divide-y divide-slate-700">
+                            {processedData.filtered.map((c, i) => (
+                                <tr key={i} className="hover:bg-slate-700/50">
+                                    <td className="p-2 font-medium text-white">{c.nome_candidato}</td>
+                                    <td className="p-2 font-bold">{c.score_aderencia}</td>
+                                    <td className="p-2">{renderClassificacao(c.score_aderencia)}</td>
+                                </tr>
+                            ))}
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
+      </div>
+    </div>
+  );
+}
+
+// Sub-componentes simples para manter o código limpo
+function KPICard({ title, value }) {
+    return (
+        <div className="bg-slate-800 p-6 rounded-xl border border-slate-700 flex flex-col items-center justify-center text-center">
+            <span className="text-4xl font-bold text-white mb-2">{value}</span>
+            <span className="text-slate-400 text-sm font-medium">{title}</span>
+        </div>
+    );
+}
+
+function MiniTable({ title, data, cols }) {
+    // Implementação simplificada da tabela pequena
+    return <div className="bg-slate-800 p-4 rounded-xl border border-slate-700">
+        <h3 className="text-sm font-semibold mb-3 text-slate-200">{title}</h3>
+        {/* ... table structure ... */}
+    </div>
+}
+
+==================================================
+FILE: frontend\eslint.config.js
+==================================================
+
+import js from '@eslint/js'
+import globals from 'globals'
+import reactHooks from 'eslint-plugin-react-hooks'
+import reactRefresh from 'eslint-plugin-react-refresh'
+import { defineConfig, globalIgnores } from 'eslint/config'
+
+export default defineConfig([
+  globalIgnores(['dist']),
+  {
+    files: ['**/*.{js,jsx}'],
+    extends: [
+      js.configs.recommended,
+      reactHooks.configs.flat.recommended,
+      reactRefresh.configs.vite,
+    ],
+    languageOptions: {
+      ecmaVersion: 2020,
+      globals: globals.browser,
+      parserOptions: {
+        ecmaVersion: 'latest',
+        ecmaFeatures: { jsx: true },
+        sourceType: 'module',
+      },
+    },
+    rules: {
+      'no-unused-vars': ['error', { varsIgnorePattern: '^[A-Z_]' }],
+    },
+  },
+])
+
+
+==================================================
+FILE: frontend\index.html
+==================================================
+
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/vite.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>CV Engine Pro</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>
+
+
+==================================================
+FILE: frontend\package.json
+==================================================
+
+{
+  "name": "frontend",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "lint": "eslint .",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "axios": "^1.13.5",
+    "clsx": "^2.1.1",
+    "framer-motion": "^12.34.0",
+    "lucide-react": "^0.564.0",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
+    "react-router-dom": "^7.13.0",
+    "recharts": "^3.7.0",
+    "tailwind-merge": "^3.4.1"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.39.1",
+    "@types/react": "^19.2.7",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^5.1.4",
+    "autoprefixer": "^10.4.24",
+    "eslint": "^9.39.1",
+    "eslint-plugin-react-hooks": "^7.0.1",
+    "eslint-plugin-react-refresh": "^0.4.24",
+    "globals": "^16.5.0",
+    "postcss": "^8.5.6",
+    "tailwindcss": "^3.4.17",
+    "vite": "^5.4.11"
+  }
+}
+
+
+==================================================
+FILE: frontend\postcss.config.js
+==================================================
+
+export default {
+    plugins: {
+        tailwindcss: {},
+        autoprefixer: {},
+    },
+}
+
+
+==================================================
+FILE: frontend\README.md
+==================================================
+
+# React + Vite
+
+This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+
+Currently, two official plugins are available:
+
+- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Babel](https://babeljs.io/) (or [oxc](https://oxc.rs) when used in [rolldown-vite](https://vite.dev/guide/rolldown)) for Fast Refresh
+- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/) for Fast Refresh
+
+## React Compiler
+
+The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+
+## Expanding the ESLint configuration
+
+If you are developing a production application, we recommend using TypeScript with type-aware lint rules enabled. Check out the [TS template](https://github.com/vitejs/vite/tree/main/packages/create-vite/template-react-ts) for information on how to integrate TypeScript and [`typescript-eslint`](https://typescript-eslint.io) in your project.
+
+
+==================================================
+FILE: frontend\tailwind.config.js
+==================================================
+
+/** @type {import('tailwindcss').Config} */
+export default {
+  content: [
+    "./index.html",
+    "./src/**/*.{js,ts,jsx,tsx}",
+  ],
+  theme: {
+    extend: {
+      colors: {
+        brand: {
+          dark: '#0f172a', // Slate-900 base
+          neon: '#a3e635', // Lime-400
+          accent: '#2563eb', // Blue-600
+        }
+      },
+      fontFamily: {
+        sans: ['Inter', 'sans-serif'],
+      }
+    },
+  },
+  plugins: [],
+}
+
+
+==================================================
+FILE: frontend\vite.config.js
+==================================================
+
+import { defineConfig } from 'vite'
+import react from '@vitejs/plugin-react'
+
+// https://vite.dev/config/
+export default defineConfig({
+  plugins: [react()],
+})
+

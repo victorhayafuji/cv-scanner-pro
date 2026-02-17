@@ -1,0 +1,17 @@
+streamlit
+langchain-google-genai
+langchain-community
+langchain-core
+faiss-cpu
+sentence-transformers
+python-dotenv
+pydantic
+pypdf
+pandas
+openpyxl
+fastapi
+uvicorn
+python-multipart
+python-jose[cryptography]
+passlib[bcrypt]
+bcrypt
