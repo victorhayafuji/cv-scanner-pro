@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { useNavigate, Link } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
 import { motion } from 'framer-motion';
@@ -8,8 +8,14 @@ export default function Signup() {
     const [password, setPassword] = useState('');
     const [empresa, setEmpresa] = useState('');
     const [error, setError] = useState('');
-    const { signup } = useAuth();
+    const { signup, user } = useAuth();
     const navigate = useNavigate();
+
+    useEffect(() => {
+        if (user) {
+            navigate('/');
+        }
+    }, [user, navigate]);
 
     const handleSubmit = async (e) => {
         e.preventDefault();
