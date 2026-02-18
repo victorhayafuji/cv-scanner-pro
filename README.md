@@ -42,43 +42,55 @@ O projeto segue uma arquitetura desacoplada (Client-Server), focada em performan
 
 ---
 
-## 🛠️ Instalação e Execução (Setup Local)
+## 🛠️ Instalação e Execução (Quick Start)
 
-### 1. Configuração do Back-end (FastAPI)
+### 🚀 Modo Automático (Recomendado)
 
-Na raiz do projeto, crie o ambiente virtual e instale as dependências:
+O projeto possui um orquestrador inteligente que sobe **Backend** e **Frontend** simultaneamente, gerenciando portas e ambientes virtuais.
 
+1. Ative seu ambiente virtual (se ainda não estiver ativo):
+   ```bash
+   # Windows
+   venv\Scripts\activate
+   ```
+
+2. Execute o launcher principal:
+   ```bash
+   python main.py
+   ```
+   *Isso iniciará a API na porta 8000 e o Frontend na porta 5173.*
+
+---
+
+### 🛡️ Testes de Segurança (Security)
+
+O projeto inclui um script automatizado de verificação de segurança (`security_tests.py`) que testa:
+* ✅ **Auth Bypass:** Tentativa de acesso a rotas protegidas sem token.
+* ✅ **SQL Injection:** Tentativa de injeção de SQL no login.
+* ✅ **XSS (Cross-Site Scripting):** Tratamento de payloads maliciosos.
+* ✅ **Rate Limiting:** Verificação de resistência a flood de requisições.
+* ✅ **Upload Malicioso:** Bloqueio de arquivos executáveis (.exe, .py).
+
+Para rodar a bateria de testes (o script sobe e desce o servidor automaticamente):
 ```bash
-python -m venv venv
-# Windows:
-venv\Scripts\activate
-# Linux/Mac:
-source venv/bin/activate
-
-pip install -r requirements.txt
+python security_tests.py
 ```
 
-Crie o arquivo `.env` na raiz:
+---
 
-```env
-GOOGLE_API_KEY="sua_chave_do_gemini"
-MODEL_NAME="gemini-2.5-flash"
-```
+### ⚙️ Execução Manual (Modo Avançado)
 
-Inicie o servidor da API:
+Caso prefira rodar os serviços separadamente em terminais distintos:
 
+#### 1. Back-end (FastAPI)
 ```bash
-uvicorn src.main:app --reload --port 8000
+# Certifique-se de estar no venv
+uvicorn src.api:app --reload --port 8000
 ```
-*A API rodará em: `http://localhost:8000` | Swagger: `http://localhost:8000/docs`*
 
-### 2. Configuração do Front-end (Next.js)
-
-Em um novo terminal, navegue até a pasta do cliente:
-
+#### 2. Front-end (Next.js/Vite)
 ```bash
 cd frontend
-npm install
 npm run dev
 ```
 *O SaaS estará disponível em: `http://localhost:5173`*
